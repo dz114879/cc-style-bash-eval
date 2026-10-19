@@ -2,7 +2,7 @@ import type { ExtensionAPI, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { bashToolRenderer } from "@oh-my-pi/pi-tui/tools/bash";
 import { evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
-import type { LiveTurnGroups } from "./summary";
+import type { TurnGroups } from "./summary";
 
 type CompressibleTool = Omit<ToolDefinition, "renderCall" | "renderResult"> & {
 	promptGuidelines?: string[];
@@ -14,10 +14,7 @@ type CompressibleTool = Omit<ToolDefinition, "renderCall" | "renderResult"> & {
 	) => Component | undefined;
 };
 
-export function registerBashEval(
-	pi: ExtensionAPI,
-	groups: LiveTurnGroups,
-): void {
+export function registerBashEval(pi: ExtensionAPI, groups: TurnGroups): void {
 	for (const native of pi.getAllTools()) {
 		if (native.name !== "bash" && native.name !== "eval") continue;
 		const override: CompressibleTool = {
