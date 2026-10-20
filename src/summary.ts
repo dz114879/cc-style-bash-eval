@@ -1,5 +1,7 @@
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { type Component, truncateToWidth } from "@oh-my-pi/pi-tui";
+import { markFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 
 interface TurnGroup {
 	bash: number;
@@ -73,24 +75,36 @@ export class TurnGroups {
 		return branch ? { group: branch, index: branch.index } : live;
 	}
 
-	summary(input: object): Component | undefined {
+	summary(input: object, theme: Theme): Component | undefined {
 		const call = this.lookup(input);
 		if (call?.index !== 0) return undefined;
-		return {
+		return markFramedBlockComponent({
 			render: (width: number) => {
 				const currentCall = this.lookup(input);
 				if (currentCall?.index !== 0) return [];
 				const group = currentCall.group;
-				const parts: string[] = [];
-				if (group.bash > 0)
-					parts.push(`Ran ${group.bash} command${group.bash === 1 ? "" : "s"}`);
-				if (group.eval > 0) {
-					parts.push(
-						`${group.bash > 0 ? "evaluated" : "Evaluated"} ${group.eval} cell${group.eval === 1 ? "" : "s"}`,
-					);
+				const count = (value: number) =>
+					theme.fg("accent", theme.bold(String(value)));
+				let wording = "";
+				if (group.bash > 0) {
+					wording +=
+						theme.fg("muted", "Ran ") +
+						count(group.bash) +
+						theme.fg("muted", group.bash === 1 ? " command" : " commands");
 				}
-				return [truncateToWidth(parts.join(", "), width)];
+				if (group.eval > 0) {
+					wording +=
+						theme.fg("muted", group.bash > 0 ? ", evaluated " : "Evaluated ") +
+						count(group.eval) +
+						theme.fg("muted", group.eval === 1 ? " cell" : " cells");
+				}
+				return [
+					truncateToWidth(
+						` ${theme.fg("dim", theme.format.bullet)} ${wording}`,
+						width,
+					),
+				];
 			},
-		};
+		});
 	}
 }

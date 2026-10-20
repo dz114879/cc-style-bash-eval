@@ -10,10 +10,14 @@ import {
 	type ToolInfo,
 } from "@oh-my-pi/pi-coding-agent";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import { trimBlankEdges } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import { Theme, type ThemeColor, type ThemeBg } from "@oh-my-pi/pi-tui/theme";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { initThemeSync, theme } from "@oh-my-pi/pi-tui/theme";
 import ccStyleBashEval from "../src/index";
 
-initThemeSync();
+initThemeSync("unicode");
 
 const collapsed = { expanded: false, isPartial: false };
 const nativeResult = {
@@ -163,11 +167,15 @@ test("one live summary line counts bash calls across internal turns, prose and n
 		input: first,
 	});
 	const summary = bash.renderCall?.(first, collapsed, theme);
-	expect(summary?.render(100)).toEqual(["Ran 1 command"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command",
+	]);
 	const narrowSummary = summary!.render(10);
 	expect(narrowSummary).toHaveLength(1);
 	expect(visibleWidth(narrowSummary[0])).toBeLessThanOrEqual(10);
-	expect(summary?.render(100)).toEqual(["Ran 1 command"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command",
+	]);
 	expect(
 		bash.renderResult?.(nativeResult, collapsed, theme, first),
 	).toBeUndefined();
@@ -190,15 +198,20 @@ test("one live summary line counts bash calls across internal turns, prose and n
 		toolCallId: "b2",
 		input: second,
 	});
-	expect(summary?.render(100)).toEqual(["Ran 2 commands"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 commands",
+	]);
 	for (let repaint = 0; repaint < 2; repaint++) {
 		expect(bash.renderCall?.(second, collapsed, theme)).toBeUndefined();
 		expect(
 			bash.renderResult?.(nativeResult, collapsed, theme, second),
 		).toBeUndefined();
-		expect(bash.renderCall?.(first, collapsed, theme)?.render(100)).toEqual([
-			"Ran 2 commands",
-		]);
+		expect(
+			bash
+				.renderCall?.(first, collapsed, theme)
+				?.render(100)
+				.map(stripVTControlCharacters),
+		).toEqual([" • Ran 2 commands"]);
 	}
 });
 
@@ -224,7 +237,9 @@ test("a new prompt gets its own eval summary line while earlier turn groups rema
 		input: first,
 	});
 	const summary = evalTool.renderCall?.(first, collapsed, theme);
-	expect(summary?.render(100)).toEqual(["Evaluated 1 cell"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Evaluated 1 cell",
+	]);
 	const second = { language: "py", code: "print(2)" };
 	await h.emit("turn_start");
 	await h.emit("tool_call", {
@@ -232,7 +247,9 @@ test("a new prompt gets its own eval summary line while earlier turn groups rema
 		toolCallId: "e2",
 		input: second,
 	});
-	expect(summary?.render(100)).toEqual(["Evaluated 2 cells"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Evaluated 2 cells",
+	]);
 	expect(evalTool.renderCall?.(second, collapsed, theme)).toBeUndefined();
 	expect(
 		evalTool.renderResult?.(nativeResult, collapsed, theme, first),
@@ -240,12 +257,19 @@ test("a new prompt gets its own eval summary line while earlier turn groups rema
 	expect(
 		evalTool.renderResult?.(nativeResult, collapsed, theme, second),
 	).toBeUndefined();
-	expect(oldSummary?.render(100)).toEqual(["Ran 1 command"]);
-	expect(bash.renderCall?.(oldArgs, collapsed, theme)?.render(100)).toEqual([
-		"Ran 1 command",
+	expect(oldSummary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command",
 	]);
+	expect(
+		bash
+			.renderCall?.(oldArgs, collapsed, theme)
+			?.render(100)
+			.map(stripVTControlCharacters),
+	).toEqual([" • Ran 1 command"]);
 	await h.emit("before_agent_start");
-	expect(summary?.render(100)).toEqual(["Evaluated 2 cells"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Evaluated 2 cells",
+	]);
 });
 
 test("mixed turn groups keep first-call ownership and bash-first wording in either execution order", async () => {
@@ -277,7 +301,9 @@ test("mixed turn groups keep first-call ownership and bash-first wording in eith
 			toolCallId: calls[1].id,
 			input: calls[1].input,
 		});
-		expect(summary?.render(100)).toEqual(["Ran 1 command, evaluated 1 cell"]);
+		expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 command, evaluated 1 cell",
+		]);
 		const later = h.tools.get(calls[1].name)!;
 		expect(
 			later.renderCall?.(calls[1].input, collapsed, theme),
@@ -290,16 +316,23 @@ test("mixed turn groups keep first-call ownership and bash-first wording in eith
 			toolCallId: "b-extra",
 			input: { command: "echo extra" },
 		});
-		expect(summary?.render(100)).toEqual(["Ran 2 commands, evaluated 1 cell"]);
+		expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+			" • Ran 2 commands, evaluated 1 cell",
+		]);
 		await h.emit("tool_call", {
 			toolName: "eval",
 			toolCallId: "e-extra",
 			input: { language: "py", code: "print(4)" },
 		});
-		expect(summary?.render(100)).toEqual(["Ran 2 commands, evaluated 2 cells"]);
+		expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+			" • Ran 2 commands, evaluated 2 cells",
+		]);
 		expect(
-			owner.renderCall?.(calls[0].input, collapsed, theme)?.render(100),
-		).toEqual(["Ran 2 commands, evaluated 2 cells"]);
+			owner
+				.renderCall?.(calls[0].input, collapsed, theme)
+				?.render(100)
+				.map(stripVTControlCharacters),
+		).toEqual([" • Ran 2 commands, evaluated 2 cells"]);
 	}
 });
 
@@ -364,8 +397,13 @@ test("expanded mode restores every native card once and collapsing restores only
 			expect(text).toContain(call.output);
 			expect(text).not.toContain("Ran 2 commands");
 			expect(
-				tool.renderCall?.(call.input, collapsed, theme)?.render(100),
-			).toEqual(index === 0 ? ["Ran 2 commands, evaluated 1 cell"] : undefined);
+				tool
+					.renderCall?.(call.input, collapsed, theme)
+					?.render(100)
+					.map(stripVTControlCharacters),
+			).toEqual(
+				index === 0 ? [" • Ran 2 commands, evaluated 1 cell"] : undefined,
+			);
 			expect(
 				tool.renderResult?.(result, collapsed, theme, call.input),
 			).toBeUndefined();
@@ -382,14 +420,14 @@ test("branch fallback resumes one summary line per user turn across bash, eval a
 				{ name: "bash", arguments: { command: "echo same" } },
 				{ name: "bash", arguments: { command: "echo same" } },
 			],
-			summary: "Ran 2 commands",
+			summary: " • Ran 2 commands",
 		},
 		{
 			calls: [
 				{ name: "eval", arguments: { language: "py", code: "print(1)" } },
 				{ name: "eval", arguments: { language: "py", code: "print(2)" } },
 			],
-			summary: "Evaluated 2 cells",
+			summary: " • Evaluated 2 cells",
 		},
 		{
 			calls: [
@@ -397,7 +435,7 @@ test("branch fallback resumes one summary line per user turn across bash, eval a
 				{ name: "bash", arguments: { command: "echo same" } },
 				{ name: "eval", arguments: { language: "py", code: "print(4)" } },
 			],
-			summary: "Ran 1 command, evaluated 2 cells",
+			summary: " • Ran 1 command, evaluated 2 cells",
 		},
 	];
 	for (const [turn, { calls }] of turns.entries()) {
@@ -426,7 +464,10 @@ test("branch fallback resumes one summary line per user turn across bash, eval a
 		for (const [index, call] of calls.entries()) {
 			const tool = h.tools.get(call.name)!;
 			expect(
-				tool.renderCall?.(call.arguments, collapsed, theme)?.render(100),
+				tool
+					.renderCall?.(call.arguments, collapsed, theme)
+					?.render(100)
+					.map(stripVTControlCharacters),
 			).toEqual(index === 0 ? [summary] : undefined);
 			expect(
 				tool.renderResult?.(nativeResult, collapsed, theme, call.arguments),
@@ -456,7 +497,9 @@ test("branch fallback refreshes existing summary lines on message_end and observ
 	h.sessionManager.appendMessage(message);
 	await h.emit("message_end", { message });
 	const summary = bash.renderCall?.(first, collapsed, theme);
-	expect(summary?.render(100)).toEqual(["Ran 1 command"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command",
+	]);
 
 	const second = { language: "py", code: "print(42)" };
 	h.sessionManager.appendMessage(
@@ -485,7 +528,9 @@ test("branch fallback refreshes existing summary lines on message_end and observ
 		{ type: "text", text: "complete stdout\\ncomplete stderr" },
 	]);
 	expect(result.details).toEqual({ untouched: "native details" });
-	expect(summary?.render(100)).toEqual(["Ran 1 command, evaluated 1 cell"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command, evaluated 1 cell",
+	]);
 	expect(evalTool.renderCall?.(second, collapsed, theme)).toBeUndefined();
 
 	const third = { command: "echo third" };
@@ -497,10 +542,15 @@ test("branch fallback refreshes existing summary lines on message_end and observ
 	});
 	h.sessionManager.appendMessage(lastMessage);
 	await h.emit("message_end", { message: lastMessage });
-	expect(summary?.render(100)).toEqual(["Ran 2 commands, evaluated 1 cell"]);
-	expect(bash.renderCall?.(first, collapsed, theme)?.render(100)).toEqual([
-		"Ran 2 commands, evaluated 1 cell",
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 commands, evaluated 1 cell",
 	]);
+	expect(
+		bash
+			.renderCall?.(first, collapsed, theme)
+			?.render(100)
+			.map(stripVTControlCharacters),
+	).toEqual([" • Ran 2 commands, evaluated 1 cell"]);
 	expect(bash.renderCall?.(third, collapsed, theme)).toBeUndefined();
 });
 
@@ -540,7 +590,9 @@ test("live summary lines reconcile to completed branch totals across result, mes
 		input: first,
 	});
 	const summary = bash.renderCall?.(first, collapsed, theme);
-	expect(summary?.render(100)).toEqual(["Ran 1 command"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command",
+	]);
 
 	const message = assistantMessage(
 		...calls.slice(0, 2).map((call, index) => ({
@@ -552,13 +604,17 @@ test("live summary lines reconcile to completed branch totals across result, mes
 	);
 	h.sessionManager.appendMessage(message);
 	await h.emit("message_end", { message });
-	expect(summary?.render(100)).toEqual(["Ran 1 command"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command",
+	]);
 	await h.emit("tool_call", {
 		toolName: "eval",
 		toolCallId: "e1",
 		input: calls[1].arguments,
 	});
-	expect(summary?.render(100)).toEqual(["Ran 1 command, evaluated 1 cell"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 command, evaluated 1 cell",
+	]);
 	for (let repaint = 0; repaint < 2; repaint++) {
 		await h.emit("tool_result", {
 			toolName: "eval",
@@ -568,7 +624,9 @@ test("live summary lines reconcile to completed branch totals across result, mes
 			isError: false,
 		});
 		await h.emit("message_end", { message });
-		expect(summary?.render(100)).toEqual(["Ran 1 command, evaluated 1 cell"]);
+		expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 command, evaluated 1 cell",
+		]);
 	}
 	await h.emit("tool_call", {
 		toolName: "bash",
@@ -582,7 +640,9 @@ test("live summary lines reconcile to completed branch totals across result, mes
 		...nativeResult,
 		isError: false,
 	});
-	expect(summary?.render(100)).toEqual(["Ran 2 commands, evaluated 1 cell"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 commands, evaluated 1 cell",
+	]);
 
 	// The final persisted call has no live event, as on an interrupted tool batch.
 	const finalMessage = assistantMessage(
@@ -610,13 +670,16 @@ test("live summary lines reconcile to completed branch totals across result, mes
 		toolCallId: "next",
 		input: next.arguments,
 	});
-	expect(summary?.render(100)).toEqual(["Ran 2 commands, evaluated 2 cells"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 commands, evaluated 2 cells",
+	]);
 	expect(
 		h.tools
 			.get("eval")!
 			.renderCall?.(next.arguments, collapsed, theme)
-			?.render(100),
-	).toEqual(["Evaluated 1 cell"]);
+			?.render(100)
+			.map(stripVTControlCharacters),
+	).toEqual([" • Evaluated 1 cell"]);
 	const nextMessage = assistantMessage({
 		type: "toolCall",
 		id: "next",
@@ -625,7 +688,9 @@ test("live summary lines reconcile to completed branch totals across result, mes
 	});
 	h.sessionManager.appendMessage(nextMessage);
 	await h.emit("message_end", { message: nextMessage });
-	expect(summary?.render(100)).toEqual(["Ran 2 commands, evaluated 2 cells"]);
+	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 commands, evaluated 2 cells",
+	]);
 });
 
 test("historical and resumed bash and eval cards expand fully and collapse to one summary line per turn group", async () => {
@@ -747,12 +812,15 @@ test("historical and resumed bash and eval cards expand fully and collapse to on
 				expect(text.split(source)).toHaveLength(2);
 				expect(text).toContain("native output");
 				expect(
-					tool.renderCall?.(call.arguments, collapsed, theme)?.render(100),
+					tool
+						.renderCall?.(call.arguments, collapsed, theme)
+						?.render(100)
+						.map(stripVTControlCharacters),
 				).toEqual(
 					index === 0
-						? ["Ran 2 commands, evaluated 2 cells"]
+						? [" • Ran 2 commands, evaluated 2 cells"]
 						: index === 4
-							? ["Evaluated 1 cell"]
+							? [" • Evaluated 1 cell"]
 							: undefined,
 				);
 				expect(
@@ -760,5 +828,146 @@ test("historical and resumed bash and eval cards expand fully and collapse to on
 				).toBeUndefined();
 			}
 		}
+	}
+});
+
+test("explicit theme styles every wording span around bold accent counts and uses its own bullet", async () => {
+	const level = chalk.level;
+	chalk.level = 3;
+	try {
+		const customTheme = new Theme(
+			{ dim: "#112233", muted: "#445566", accent: "#778899" } as Record<
+				ThemeColor,
+				string
+			>,
+			{} as Record<ThemeBg, string>,
+			"truecolor",
+			"unicode",
+			{ "format.bullet": "◆" },
+		);
+		const h = harness();
+		h.getAllTools.mockReturnValue(nativeTools());
+		await h.emit("session_start");
+		const args = { language: "py", code: "print(1)" };
+		await h.emit("tool_call", { toolName: "eval", input: args });
+		const summary = h.tools.get("eval")!.renderCall!(
+			args,
+			collapsed,
+			customTheme,
+		);
+		const prefix = ` ${customTheme.fg("dim", "◆")} `;
+		const count = (n: number) =>
+			customTheme.fg("accent", customTheme.bold(String(n)));
+		expect(count(1)).toContain("\x1b[1m");
+		expect(count(1)).toContain("\x1b[39m");
+		expect(summary.render(100)).toEqual([
+			prefix +
+				customTheme.fg("muted", "Evaluated ") +
+				count(1) +
+				customTheme.fg("muted", " cell"),
+		]);
+		await h.emit("tool_call", { toolName: "bash", input: { command: "true" } });
+		await h.emit("tool_call", { toolName: "bash", input: { command: "true" } });
+		await h.emit("tool_call", { toolName: "eval", input: { code: "2" } });
+		const expected =
+			prefix +
+			customTheme.fg("muted", "Ran ") +
+			count(2) +
+			customTheme.fg("muted", " commands") +
+			customTheme.fg("muted", ", evaluated ") +
+			count(2) +
+			customTheme.fg("muted", " cells");
+		expect(summary.render(100)).toEqual([expected]);
+		expect(stripVTControlCharacters(summary.render(100)[0]!)).toBe(
+			" ◆ Ran 2 commands, evaluated 2 cells",
+		);
+		for (const width of [1, 5, 12, 24]) {
+			const rows = summary.render(width);
+			expect(rows).toHaveLength(1);
+			expect(visibleWidth(rows[0])).toBeLessThanOrEqual(width);
+		}
+		expect(summary.render(100)).toEqual([expected]);
+	} finally {
+		chalk.level = level;
+	}
+});
+
+test("real host trims raw ANSI summaries to one unfilled row through streaming, results, allocation and expansion", async () => {
+	const level = chalk.level;
+	chalk.level = 3;
+	try {
+		for (const name of ["bash", "eval"]) {
+			const h = harness();
+			h.getAllTools.mockReturnValue(nativeTools());
+			await h.emit("session_start");
+			const args =
+				name === "bash"
+					? { command: "printf HOST-OUTPUT" }
+					: { language: "py", code: "print('HOST-OUTPUT')" };
+			const tool = h.tools.get(name)!;
+			const component = new ToolExecutionComponent(
+				name,
+				args,
+				{ useBuiltInRenderer: false },
+				// Host core types erase the extension Theme and execution context.
+				tool as unknown as ConstructorParameters<
+					typeof ToolExecutionComponent
+				>[3],
+				{ requestRender() {}, requestComponentRender() {}, resetDisplay() {} },
+			);
+			expect(trimBlankEdges(component.render(100))).toHaveLength(0);
+			await h.emit("tool_call", { toolName: name, input: args });
+			component.setArgsComplete();
+			component.setExecutionStarted();
+			const expected =
+				name === "bash" ? " • Ran 1 command" : " • Evaluated 1 cell";
+			const check = (width = 100) => {
+				const rows = trimBlankEdges(component.render(width));
+				expect(rows).toHaveLength(1);
+				expect(visibleWidth(rows[0])).toBeLessThanOrEqual(width);
+				if (width === 100)
+					expect(stripVTControlCharacters(rows[0])).toBe(
+						expected.padEnd(width),
+					);
+				for (const bg of [
+					"toolPendingBg",
+					"toolSuccessBg",
+					"toolErrorBg",
+				] as const) {
+					const backgroundCode = theme.bg(bg, "X").split("X")[0];
+					expect(backgroundCode).not.toBe("");
+					expect(rows[0]).not.toContain(backgroundCode);
+				}
+			};
+			check();
+			component.setTranscriptAllocation(1, { tick: 0, now: 0 });
+			check();
+			check(10);
+			check();
+			for (const isError of [false, true]) {
+				component.updateResult({
+					content: [{ type: "text", text: "HOST-OUTPUT" }],
+					details: name === "bash" ? { exitCode: isError ? 1 : 0 } : {},
+					isError,
+				});
+				check();
+				for (let toggle = 0; toggle < 2; toggle++) {
+					component.setTranscriptAllocation(100, { tick: 0, now: 0 });
+					component.setExpanded(true);
+					const expanded = trimBlankEdges(component.render(100));
+					expect(expanded.length).toBeGreaterThan(1);
+					const text = stripVTControlCharacters(expanded.join("\n"));
+					expect(text).toContain("HOST-OUTPUT");
+					expect(text).not.toContain(expected);
+					component.setExpanded(false);
+					check();
+					component.setTranscriptAllocation(1, { tick: 0, now: 0 });
+					check(10);
+					check();
+				}
+			}
+		}
+	} finally {
+		chalk.level = level;
 	}
 });

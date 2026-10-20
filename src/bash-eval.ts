@@ -33,8 +33,10 @@ export function registerBashEval(pi: ExtensionAPI, groups: TurnGroups): void {
 					onUpdate,
 				});
 			},
-			renderCall(args, options) {
-				return options.expanded ? undefined : groups.summary(args as object);
+			renderCall(args, options, theme) {
+				return options.expanded
+					? undefined
+					: groups.summary(args as object, theme);
 			},
 			renderResult(result, options, theme, args) {
 				if (!options.expanded) return undefined;
