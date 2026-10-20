@@ -3,9 +3,16 @@ import { type Component, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { markFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 
+export type TrackedToolName = "bash" | "eval" | "grep";
+
+export function isTrackedToolName(name: string): name is TrackedToolName {
+	return name === "bash" || name === "eval" || name === "grep";
+}
+
 interface TurnGroup {
 	bash: number;
 	eval: number;
+	grep: number;
 }
 
 interface TurnGroupSummary extends TurnGroup {
@@ -14,7 +21,7 @@ interface TurnGroupSummary extends TurnGroup {
 }
 
 export class TurnGroups {
-	private current: TurnGroup = { bash: 0, eval: 0 };
+	private current: TurnGroup = { bash: 0, eval: 0, grep: 0 };
 	private readonly calls = new WeakMap<
 		object,
 		{ group: TurnGroup; index: number }
@@ -26,20 +33,18 @@ export class TurnGroups {
 		let group: TurnGroup & { calls: object[] } = {
 			bash: 0,
 			eval: 0,
+			grep: 0,
 			calls: [],
 		};
 		groups.push(group);
 		for (const entry of entries) {
 			if (entry.type !== "message") continue;
 			if (entry.message.role === "user") {
-				group = { bash: 0, eval: 0, calls: [] };
+				group = { bash: 0, eval: 0, grep: 0, calls: [] };
 				groups.push(group);
 			} else if (entry.message.role === "assistant") {
 				for (const content of entry.message.content) {
-					if (
-						content.type !== "toolCall" ||
-						(content.name !== "bash" && content.name !== "eval")
-					)
+					if (content.type !== "toolCall" || !isTrackedToolName(content.name))
 						continue;
 					group[content.name]++;
 					group.calls.push(content.arguments);
@@ -47,20 +52,20 @@ export class TurnGroups {
 			}
 		}
 		this.branch = new WeakMap();
-		for (const [turn, { bash, eval: cells, calls }] of groups.entries()) {
+		for (const [turn, { bash, eval: cells, grep, calls }] of groups.entries()) {
 			for (const [index, input] of calls.entries()) {
-				this.branch.set(input, { turn, index, bash, eval: cells });
+				this.branch.set(input, { turn, index, bash, eval: cells, grep });
 			}
 		}
 	}
 
 	startPrompt(): void {
-		this.current = { bash: 0, eval: 0 };
+		this.current = { bash: 0, eval: 0, grep: 0 };
 	}
 
 	record(toolName: string, input: object): void {
-		if (toolName !== "bash" && toolName !== "eval") return;
-		const index = this.current.bash + this.current.eval;
+		if (!isTrackedToolName(toolName)) return;
+		const index = this.current.bash + this.current.eval + this.current.grep;
 		this.current[toolName]++;
 		this.calls.set(input, { group: this.current, index });
 	}
@@ -86,21 +91,35 @@ export class TurnGroups {
 				const count = (value: number) =>
 					theme.fg("accent", theme.bold(String(value)));
 				let wording = "";
-				if (group.bash > 0) {
+				const appendClause = (
+					total: number,
+					leadingVerb: string,
+					followingVerb: string,
+					singularNoun: string,
+					pluralNoun: string,
+				) => {
+					if (total === 0) return;
+					if (wording) wording += theme.fg("muted", ", ");
 					wording +=
-						theme.fg("muted", "Ran ") +
-						count(group.bash) +
-						theme.fg(
-							"muted",
-							group.bash === 1 ? " bash command" : " bash commands",
-						);
-				}
-				if (group.eval > 0) {
-					wording +=
-						theme.fg("muted", group.bash > 0 ? ", evaluated " : "Evaluated ") +
-						count(group.eval) +
-						theme.fg("muted", group.eval === 1 ? " cell" : " cells");
-				}
+						theme.fg("muted", wording ? followingVerb : leadingVerb) +
+						count(total) +
+						theme.fg("muted", total === 1 ? singularNoun : pluralNoun);
+				};
+				appendClause(
+					group.bash,
+					"Ran ",
+					"ran ",
+					" bash command",
+					" bash commands",
+				);
+				appendClause(group.eval, "Evaluated ", "evaluated ", " cell", " cells");
+				appendClause(
+					group.grep,
+					"Grepped ",
+					"grepped ",
+					" pattern",
+					" patterns",
+				);
 				return [
 					truncateToWidth(
 						` ${theme.fg("dim", theme.format.bullet)} ${wording}`,

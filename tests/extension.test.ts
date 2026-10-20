@@ -9,6 +9,10 @@ import {
 	type ToolDefinition,
 	type ToolInfo,
 } from "@oh-my-pi/pi-coding-agent";
+import {
+	isMountableUnderXdev,
+	XDEV_KEEP_TOP_LEVEL,
+} from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { trimBlankEdges } from "@oh-my-pi/pi-tui/chrome/transcript-container";
@@ -19,6 +23,10 @@ import {
 	type ThemeColor,
 	theme,
 } from "@oh-my-pi/pi-tui/theme";
+import {
+	type GrepToolDetails,
+	grepToolRenderer,
+} from "@oh-my-pi/pi-tui/tools/grep";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import ccStyleToolSummary from "../src/index";
 
@@ -88,6 +96,20 @@ function nativeTools(): ToolInfo[] {
 			promptGuidelines: ["Use the session's enabled runtime."],
 		},
 		{
+			name: "grep",
+			description: "Live content search",
+			parameters: {
+				type: "object",
+				properties: { pattern: { type: "string" }, path: { type: "string" } },
+			},
+			promptGuidelines: ["Search before reading files."],
+		},
+		{
+			name: "glob",
+			description: "Native path search",
+			parameters: { type: "object" },
+		},
+		{
 			name: "read",
 			description: "Native read",
 			parameters: { type: "object" },
@@ -120,6 +142,57 @@ function assistantMessage(
 	};
 }
 
+type Call = {
+	type: "toolCall";
+	id: string;
+	name: string;
+	arguments: Record<string, unknown>;
+};
+
+function call(name: string, id: string): Call {
+	return {
+		type: "toolCall",
+		id,
+		name,
+		arguments:
+			name === "bash"
+				? { command: "true" }
+				: name === "eval"
+					? { language: "py", code: "print(1)" }
+					: { pattern: "needle", path: "src" },
+	};
+}
+
+async function start(h = harness()) {
+	h.getAllTools.mockReturnValue(nativeTools());
+	await h.emit("session_start");
+	return h;
+}
+
+async function record(h: ReturnType<typeof harness>, item: Call) {
+	await h.emit("tool_call", {
+		toolName: item.name,
+		toolCallId: item.id,
+		input: item.arguments,
+	});
+}
+
+function summary(h: ReturnType<typeof harness>, item: Call, uiTheme = theme) {
+	return h.tools.get(item.name)!.renderCall!(
+		item.arguments,
+		collapsed,
+		uiTheme,
+	);
+}
+
+function expectNoStateBg(rendered: string) {
+	for (const bg of ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const) {
+		const code = theme.bg(bg, "X").split("X")[0];
+		expect(code).not.toBe("");
+		expect(rendered).not.toContain(code);
+	}
+}
+
 test("v0.2 package loads ccStyleToolSummary through its declared extension entrypoint", async () => {
 	const packageUrl = new URL("../package.json", import.meta.url);
 	const metadata = await Bun.file(packageUrl).json();
@@ -140,7 +213,7 @@ test("session_start installs same-name overrides using live schemas and delegate
 	const liveTools = nativeTools();
 	h.getAllTools.mockReturnValue(liveTools);
 	await h.emit("session_start");
-	expect([...h.tools.keys()]).toEqual(["bash", "eval"]);
+	expect([...h.tools.keys()]).toEqual(["bash", "eval", "grep"]);
 
 	for (const native of liveTools.slice(0, 2)) {
 		const tool = h.tools.get(native.name)!;
@@ -170,6 +243,97 @@ test("session_start installs same-name overrides using live schemas and delegate
 		).toBe(result);
 		expect(invokeTool.mock.calls).toEqual([[params, { signal, onUpdate }]]);
 	}
+});
+
+test("grep copies and refreshes live metadata while retaining top-level routing", async () => {
+	const h = harness();
+	await h.emit("session_start");
+	expect(h.tools.size).toBe(0);
+	const liveTools = nativeTools();
+	const native = liveTools.find((tool) => tool.name === "grep")!;
+	h.getAllTools.mockReturnValue(liveTools);
+	await h.emit("session_start");
+	const grep = h.tools.get("grep");
+	expect(grep).toBeDefined();
+	expect(grep!.description).toBe(native.description);
+	expect(grep!.parameters).toBe(native.parameters);
+	expect(grep!.promptGuidelines).toBe(native.promptGuidelines);
+	expect(grep!.label).toBe("Grep");
+	expect(grep!.loadMode).toBe("discoverable");
+	expect(grep!.strict).toBe(true);
+	expect(grep).not.toHaveProperty("mergeCallAndResult");
+	expect(XDEV_KEEP_TOP_LEVEL.grep).toBe(true);
+	expect(isMountableUnderXdev(grep!)).toBe(false);
+
+	delete native.promptGuidelines;
+	native.description = "Updated search contract";
+	await h.emit("session_start");
+	expect(h.tools.get("grep")!.promptGuidelines).toBeUndefined();
+	expect(h.tools.get("grep")!.description).toBe("Updated search contract");
+});
+
+test("grep approval preserves native path aliases, SSH tiers and alias precedence", async () => {
+	const h = await start();
+	const grep = h.tools.get("grep")!;
+	const approval = grep!.approval;
+	if (typeof approval !== "function")
+		throw new Error("Expected dynamic approval");
+	for (const paths of [undefined, ".", "src", ["src", "tests"]]) {
+		for (const alias of ["path", "paths"]) {
+			expect(approval({ pattern: "needle", [alias]: paths })).toBe("read");
+		}
+	}
+	expect(approval({ pattern: "needle" })).toBe("read");
+	for (const paths of [
+		"ssh://host/repo",
+		["ssh://host/repo"],
+		["src", "ssh://host/repo"],
+		"ssh://one/repo;ssh://two/repo",
+		"src;ssh://host/repo",
+		["src;ssh://host/repo", "tests"],
+	]) {
+		for (const alias of ["path", "paths"]) {
+			expect(approval({ pattern: "needle", [alias]: paths })).toBe("exec");
+		}
+	}
+	expect(approval({ path: "src", paths: "ssh://host/repo" })).toBe("read");
+	expect(approval({ path: undefined, paths: "ssh://host/repo" })).toBe("exec");
+});
+
+test("grep delegates native execution, progress and cancellation errors unchanged", async () => {
+	const h = await start();
+	const grep = h.tools.get("grep")!;
+
+	const params = { pattern: "needle", path: ["src", "tests"] };
+	const controller = new AbortController();
+	const onUpdate = mock();
+	const progress = { ...nativeResult, details: { matches: 2 } };
+	const failure = new Error("native search cancelled");
+	const invokeTool = mock(
+		async (
+			input: unknown,
+			options: {
+				signal: AbortSignal;
+				onUpdate: typeof onUpdate;
+			},
+		) => {
+			expect(input).toBe(params);
+			expect(options.signal).toBe(controller.signal);
+			expect(options.onUpdate).toBe(onUpdate);
+			options.onUpdate(progress);
+			if (options.signal.aborted) throw failure;
+			return nativeResult;
+		},
+	);
+	const ctx = { invokeTool } as unknown as ExtensionContext;
+	expect(
+		await grep!.execute("g1", params, controller.signal, onUpdate, ctx),
+	).toBe(nativeResult);
+	expect(onUpdate.mock.calls[0][0]).toBe(progress);
+	controller.abort();
+	await expect(
+		grep!.execute("g2", params, controller.signal, onUpdate, ctx),
+	).rejects.toBe(failure);
 });
 
 test("one live summary line counts bash calls across internal turns, prose and non-target tools", async () => {
@@ -890,7 +1054,8 @@ test("explicit theme styles every wording span around bold accent counts and use
 				customTheme.fg("muted", "Ran ") +
 				count(1) +
 				customTheme.fg("muted", " bash command") +
-				customTheme.fg("muted", ", evaluated ") +
+				customTheme.fg("muted", ", ") +
+				customTheme.fg("muted", "evaluated ") +
 				count(1) +
 				customTheme.fg("muted", " cell"),
 		]);
@@ -904,7 +1069,8 @@ test("explicit theme styles every wording span around bold accent counts and use
 			customTheme.fg("muted", "Ran ") +
 			count(2) +
 			customTheme.fg("muted", " bash commands") +
-			customTheme.fg("muted", ", evaluated ") +
+			customTheme.fg("muted", ", ") +
+			customTheme.fg("muted", "evaluated ") +
 			count(2) +
 			customTheme.fg("muted", " cells");
 		expect(summary.render(100)).toEqual([expected]);
@@ -966,15 +1132,7 @@ test("real host trims raw ANSI summaries to one unfilled row through streaming, 
 					expect(stripVTControlCharacters(rows[0])).toBe(
 						expected.padEnd(width),
 					);
-				for (const bg of [
-					"toolPendingBg",
-					"toolSuccessBg",
-					"toolErrorBg",
-				] as const) {
-					const backgroundCode = theme.bg(bg, "X").split("X")[0];
-					expect(backgroundCode).not.toBe("");
-					expect(rows[0]).not.toContain(backgroundCode);
-				}
+				expectNoStateBg(rows[0]);
 				for (const later of components.slice(1)) {
 					expect(trimBlankEdges(later.render(width))).toHaveLength(0);
 				}
@@ -1050,3 +1208,526 @@ test("real host trims raw ANSI summaries to one unfilled row through streaming, 
 		chalk.level = level;
 	}
 });
+
+test.each([
+	[["bash"], " • Ran 1 bash command"],
+	[["eval"], " • Evaluated 1 cell"],
+	[["grep"], " • Grepped 1 pattern"],
+	[["eval", "bash"], " • Ran 1 bash command, evaluated 1 cell"],
+	[["grep", "bash"], " • Ran 1 bash command, grepped 1 pattern"],
+	[["eval", "grep"], " • Evaluated 1 cell, grepped 1 pattern"],
+	[
+		["grep", "eval", "bash"],
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern",
+	],
+	[["bash", "bash"], " • Ran 2 bash commands"],
+	[["eval", "eval"], " • Evaluated 2 cells"],
+	[["grep", "grep"], " • Grepped 2 patterns"],
+	[
+		["bash", "eval", "bash", "eval"],
+		" • Ran 2 bash commands, evaluated 2 cells",
+	],
+	[
+		["bash", "grep", "grep", "bash"],
+		" • Ran 2 bash commands, grepped 2 patterns",
+	],
+	[
+		["grep", "eval", "grep", "eval"],
+		" • Evaluated 2 cells, grepped 2 patterns",
+	],
+	[
+		["eval", "grep", "bash", "grep", "bash", "eval"],
+		" • Ran 2 bash commands, evaluated 2 cells, grepped 2 patterns",
+	],
+] as [string[], string][])(
+	"turn group %j has fixed wording and first-call ownership",
+	async (names, expected) => {
+		const h = await start();
+		await h.emit("before_agent_start");
+		const calls = names.map((name, index) => call(name, `call-${index}`));
+		await record(h, calls[0]);
+		const owner = summary(h, calls[0]);
+		expect(owner).toBeDefined();
+		for (const item of calls.slice(1)) {
+			await record(h, item);
+			expect(summary(h, item)).toBeUndefined();
+		}
+		for (const item of calls) {
+			for (const isPartial of [true, false]) {
+				expect(
+					h.tools.get(item.name)!.renderResult!(
+						nativeResult,
+						{ ...collapsed, isPartial },
+						theme,
+						item.arguments,
+					),
+				).toBeUndefined();
+			}
+		}
+		expect(owner?.render(120).map(stripVTControlCharacters)).toEqual([
+			expected,
+		]);
+	},
+);
+
+test("grep-owned summary line updates after completion across internal turns and isolates new prompts", async () => {
+	const h = await start();
+	const first = call("grep", "first");
+	expect(summary(h, first)).toBeUndefined();
+	await h.emit("before_agent_start");
+	await record(h, first);
+	const owner = summary(h, first);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	await h.emit("tool_result", {
+		toolName: "grep",
+		input: first.arguments,
+		...nativeResult,
+	});
+	await h.emit("turn_start", { turnIndex: 1 });
+	await h.emit("message_end", {
+		message: assistantMessage({
+			type: "text",
+			text: "Continuing the same prompt",
+		}),
+	});
+	for (const name of ["read", "glob", "web_search"]) {
+		await record(h, call(name, name));
+	}
+	await record(h, call("bash", "bash-1"));
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command, grepped 1 pattern",
+	]);
+	for (const name of ["grep", "bash", "eval", "grep"]) {
+		await record(h, call(name, `later-${name}`));
+	}
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns",
+	]);
+	await h.emit("before_agent_start");
+	const next = call("grep", "next");
+	await record(h, next);
+	expect(summary(h, next).render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns",
+	]);
+});
+
+test("grep theme segments restore current counts and muted wording after narrow renders", async () => {
+	const level = chalk.level;
+	chalk.level = 3;
+	try {
+		const customTheme = new Theme(
+			{ dim: "#112233", muted: "#445566", accent: "#778899" } as Record<
+				ThemeColor,
+				string
+			>,
+			{} as Record<ThemeBg, string>,
+			"truecolor",
+			"unicode",
+			{ "format.bullet": "◆" },
+		);
+		const h = await start();
+		const first = call("grep", "first");
+		await record(h, first);
+		const owner = summary(h, first, customTheme);
+		const dim = (text: string) => customTheme.fg("dim", text);
+		const muted = (text: string) => customTheme.fg("muted", text);
+		const count = (n: number) =>
+			customTheme.fg("accent", customTheme.bold(String(n)));
+		expect(owner.render(120)).toEqual([
+			` ${dim("◆")} ${muted("Grepped ")}${count(1)}${muted(" pattern")}`,
+		]);
+		for (const name of ["eval", "grep", "bash", "grep", "eval", "bash"]) {
+			await record(h, call(name, name));
+			for (const width of [1, 5, 12, 24]) {
+				const rows = owner.render(width);
+				expect(rows).toHaveLength(1);
+				expect(visibleWidth(rows[0])).toBeLessThanOrEqual(width);
+			}
+		}
+		expect(owner.render(120)).toEqual([
+			` ${dim("◆")} ${muted("Ran ")}${count(2)}${muted(" bash commands")}${muted(", ")}${muted("evaluated ")}${count(2)}${muted(" cells")}${muted(", ")}${muted("grepped ")}${count(3)}${muted(" patterns")}`,
+		]);
+		expect(stripVTControlCharacters(owner.render(120)[0])).toBe(
+			" ◆ Ran 2 bash commands, evaluated 2 cells, grepped 3 patterns",
+		);
+	} finally {
+		chalk.level = level;
+	}
+});
+
+test("grep branch fallback replays initial, empty, grep-only and mixed user turn groups by argument identity", async () => {
+	const h = harness();
+	const initial = call("grep", "initial");
+	h.sessionManager.appendMessage(assistantMessage(initial));
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "Search twice",
+		timestamp: 1,
+	});
+	const searches = [call("grep", "g1"), call("grep", "g2")];
+	expect(searches[0].arguments).toEqual(searches[1].arguments);
+	expect(searches[0].arguments).not.toBe(searches[1].arguments);
+	h.sessionManager.appendMessage(
+		assistantMessage(
+			searches[0],
+			{ type: "text", text: "More searching" },
+			call("read", "read"),
+			searches[1],
+		),
+	);
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "Empty turn",
+		timestamp: 2,
+	});
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "Mixed turn",
+		timestamp: 3,
+	});
+	const mixed = [
+		call("grep", "g3"),
+		call("eval", "e1"),
+		call("bash", "b1"),
+		call("grep", "g4"),
+	];
+	h.sessionManager.appendMessage(
+		assistantMessage(...mixed, call("glob", "glob")),
+	);
+	await start(h);
+	expect(summary(h, initial).render(120).map(stripVTControlCharacters)).toEqual(
+		[" • Grepped 1 pattern"],
+	);
+	expect(
+		summary(h, searches[0]).render(120).map(stripVTControlCharacters),
+	).toEqual([" • Grepped 2 patterns"]);
+	expect(
+		summary(h, mixed[0]).render(120).map(stripVTControlCharacters),
+	).toEqual([" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns"]);
+	for (const item of [searches[1], ...mixed.slice(1)]) {
+		expect(summary(h, item)).toBeUndefined();
+	}
+	expect(summary(h, call("grep", "equal-but-unknown"))).toBeUndefined();
+});
+
+test("grep branch fallback refreshes held summary lines on message_end and read-only tool_result", async () => {
+	const h = harness();
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "Search",
+		timestamp: 1,
+	});
+	const first = call("grep", "first");
+	h.sessionManager.appendMessage(assistantMessage(first));
+	await start(h);
+	const owner = summary(h, first);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	const message = assistantMessage(
+		call("bash", "b1"),
+		call("eval", "e1"),
+		call("grep", "g2"),
+	);
+	h.sessionManager.appendMessage(message);
+	await h.emit("message_end", { message });
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+	]);
+	const third = call("grep", "g3");
+	h.sessionManager.appendMessage(assistantMessage(third));
+	const result = {
+		toolName: "grep",
+		toolCallId: third.id,
+		input: third.arguments,
+		content: Object.freeze([
+			{ type: "text", text: "full model-visible search output" },
+		]),
+		details: Object.freeze({ matches: 12 }),
+		isError: false,
+	};
+	const before = structuredClone(result);
+	for (let rebuild = 0; rebuild < 2; rebuild++) {
+		expect(await h.emit("tool_result", Object.freeze(result))).toBeUndefined();
+		expect(result).toEqual(before);
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 bash command, evaluated 1 cell, grepped 3 patterns",
+		]);
+		expect(summary(h, third)).toBeUndefined();
+	}
+});
+
+test("grep reconciles active-live, branch and retained-live membership without crossing prompts", async () => {
+	const h = await start();
+	await h.emit("before_agent_start");
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "First prompt",
+		timestamp: 1,
+	});
+	const first = call("grep", "first");
+	const second = call("eval", "second");
+	const third = call("grep", "third");
+	await record(h, first);
+	const owner = summary(h, first);
+	h.sessionManager.appendMessage(assistantMessage(first, second));
+	await h.emit("message_end");
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	await record(h, second);
+	await record(h, third);
+	for (let rebuild = 0; rebuild < 2; rebuild++) {
+		await h.emit("message_end");
+		await h.emit("tool_result", {
+			toolName: "grep",
+			input: third.arguments,
+			...nativeResult,
+		});
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Evaluated 1 cell, grepped 2 patterns",
+		]);
+	}
+	h.sessionManager.appendMessage(
+		assistantMessage(third, call("bash", "persisted-only")),
+	);
+	await h.emit("tool_result", {
+		toolName: "grep",
+		input: third.arguments,
+		...nativeResult,
+	});
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Evaluated 1 cell, grepped 2 patterns",
+	]);
+	await h.emit("before_agent_start");
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "Next prompt",
+		timestamp: 2,
+	});
+	const next = call("grep", "next");
+	await record(h, next);
+	const nextOwner = summary(h, next);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+	]);
+	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	h.sessionManager.appendMessage(assistantMessage(next));
+	await h.emit("message_end");
+	const getBranch = h.sessionManager.getBranch.bind(h.sessionManager);
+	h.sessionManager.getBranch = () => [];
+	await h.emit("tool_result");
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Evaluated 1 cell, grepped 2 patterns",
+	]);
+	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	h.sessionManager.getBranch = getBranch;
+	await h.emit("message_end");
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+	]);
+	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+});
+
+function searchResult(
+	text: string,
+	details: GrepToolDetails = {},
+	isError = false,
+) {
+	return { content: [{ type: "text" as const, text }], details, isError };
+}
+
+const grepResults = [
+	searchResult("# src/one.ts\n*1│needle\n\n# src/two.ts\n*2│needle", {
+		matchCount: 2,
+		fileCount: 2,
+	}),
+	searchResult("No matches found", { matchCount: 0, fileCount: 0 }),
+	searchResult("No matches found"),
+	searchResult("native grep failure", {}, true),
+	searchResult("model detail", { error: "native detailed failure" }),
+];
+
+function host(h: ReturnType<typeof harness>, item: Call, native = false) {
+	return new ToolExecutionComponent(
+		item.name,
+		item.arguments,
+		{ useBuiltInRenderer: native },
+		native
+			? undefined
+			: (h.tools.get(item.name)! as unknown as ConstructorParameters<
+					typeof ToolExecutionComponent
+				>[3]),
+		{ requestRender() {}, requestComponentRender() {}, resetDisplay() {} },
+	);
+}
+
+test("expanded grep restores native matches, empty and error results for first and later live and replayed calls", async () => {
+	const level = chalk.level;
+	chalk.level = 3;
+	try {
+		for (const replay of [false, true]) {
+			const h = harness();
+			const calls = [call("grep", "first"), call("grep", "later")];
+			const args = {
+				pattern: "needle.*",
+				paths: ["src", "tests"],
+				case: false,
+				skip: 2,
+			};
+			for (const item of calls) item.arguments = { ...args };
+			if (replay) h.sessionManager.appendMessage(assistantMessage(...calls));
+			await start(h);
+			if (!replay) for (const item of calls) await record(h, item);
+			for (let toggle = 0; toggle < 2; toggle++) {
+				for (const item of calls) {
+					const tool = h.tools.get("grep")!;
+					for (const result of grepResults) {
+						for (const isPartial of [true, false]) {
+							const options = { expanded: true, isPartial };
+							expect(
+								tool.renderCall!(item.arguments, options, theme),
+							).toBeUndefined();
+							const actual = tool.renderResult!(
+								result,
+								options,
+								theme,
+								item.arguments,
+							);
+							const native = grepToolRenderer.renderResult(
+								result,
+								options,
+								theme,
+								args,
+							);
+							for (const width of [100, 18, 100]) {
+								expect(actual.render(width)).toEqual(native.render(width));
+							}
+							expect(
+								tool.renderResult!(
+									result,
+									{ ...collapsed, isPartial },
+									theme,
+									item.arguments,
+								),
+							).toBeUndefined();
+						}
+					}
+				}
+				expect(
+					summary(h, calls[0]).render(100).map(stripVTControlCharacters),
+				).toEqual([" • Grepped 2 patterns"]);
+				expect(summary(h, calls[1])).toBeUndefined();
+			}
+		}
+	} finally {
+		chalk.level = level;
+	}
+});
+
+test.each([false, true])(
+	"real host preserves grep inline layout and one-row turn groups through expansion and resize (replay=%s)",
+	async (replay) => {
+		const level = chalk.level;
+		chalk.level = 3;
+		try {
+			for (const [names, expected] of [
+				[["grep"], " • Grepped 1 pattern"],
+				[
+					["grep", "bash", "eval", "grep"],
+					" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+				],
+				[
+					["bash", "grep", "eval"],
+					" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern",
+				],
+			] as [string[], string][]) {
+				const h = harness();
+				const calls = names.map((name, index) => call(name, `host-${index}`));
+				if (replay) {
+					h.sessionManager.appendMessage({
+						role: "user",
+						content: "Saved search",
+						timestamp: 1,
+					});
+					h.sessionManager.appendMessage(assistantMessage(...calls));
+				}
+				await start(h);
+				const cards = [] as ToolExecutionComponent[];
+				for (const item of calls) {
+					const card = host(h, item);
+					if (!replay) {
+						expect(trimBlankEdges(card.render(100))).toHaveLength(0);
+						await record(h, item);
+					}
+					card.setArgsComplete();
+					card.setExecutionStarted();
+					cards.push(card);
+				}
+				const checkCollapsed = (width: number) => {
+					for (const [index, card] of cards.entries()) {
+						const rows = trimBlankEdges(card.render(width));
+						expect(rows).toHaveLength(index === 0 ? 1 : 0);
+						if (index === 0) {
+							expect(visibleWidth(rows[0])).toBeLessThanOrEqual(width);
+							if (width === 100)
+								expect(stripVTControlCharacters(rows[0])).toBe(
+									expected.padEnd(width),
+								);
+						}
+						expectNoStateBg(rows.join("\n"));
+					}
+				};
+				checkCollapsed(100);
+				for (const card of cards)
+					card.setTranscriptAllocation(1, { tick: 0, now: 0 });
+				checkCollapsed(100);
+				for (const result of grepResults) {
+					for (const [index, card] of cards.entries()) {
+						card.updateResult(
+							calls[index].name === "grep"
+								? result
+								: { ...nativeResult, isError: false },
+						);
+					}
+					checkCollapsed(100);
+					for (let toggle = 0; toggle < 2; toggle++) {
+						for (const [index, card] of cards.entries()) {
+							card.setTranscriptAllocation(100, { tick: 0, now: 0 });
+							card.setExpanded(true);
+							if (calls[index].name === "grep") {
+								const native = host(h, calls[index], true);
+								native.setArgsComplete();
+								native.updateResult(result);
+								native.setExpanded(true);
+								native.setTranscriptAllocation(100, { tick: 0, now: 0 });
+								for (const width of [100, 18, 100]) {
+									const rows = trimBlankEdges(card.render(width));
+									expect(rows).toEqual(trimBlankEdges(native.render(width)));
+									expectNoStateBg(rows.join("\n"));
+								}
+							}
+							card.setExpanded(false);
+							card.setTranscriptAllocation(1, { tick: 0, now: 0 });
+						}
+						checkCollapsed(18);
+						checkCollapsed(100);
+					}
+				}
+			}
+		} finally {
+			chalk.level = level;
+		}
+	},
+);
