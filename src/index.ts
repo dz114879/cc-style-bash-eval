@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { registerBashEval } from "./bash-eval";
 import { TurnGroups } from "./summary";
 
-export default function ccStyleBashEval(pi: ExtensionAPI): void {
+export default function ccStyleToolSummary(pi: ExtensionAPI): void {
 	const groups = new TurnGroups();
 	pi.on("session_start", (_event, ctx) => {
 		groups.rebuild(ctx.sessionManager.getBranch());

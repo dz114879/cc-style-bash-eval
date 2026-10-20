@@ -90,7 +90,10 @@ export class TurnGroups {
 					wording +=
 						theme.fg("muted", "Ran ") +
 						count(group.bash) +
-						theme.fg("muted", group.bash === 1 ? " command" : " commands");
+						theme.fg(
+							"muted",
+							group.bash === 1 ? " bash command" : " bash commands",
+						);
 				}
 				if (group.eval > 0) {
 					wording +=

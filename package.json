@@ -1,6 +1,6 @@
 {
-	"name": "cc-style-bash-eval",
-	"version": "0.1.0",
+	"name": "cc-style-tool-summary",
+	"version": "0.2.0",
 	"private": true,
 	"type": "module",
 	"omp": {
