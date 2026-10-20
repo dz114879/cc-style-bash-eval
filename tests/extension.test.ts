@@ -24,6 +24,10 @@ import {
 	theme,
 } from "@oh-my-pi/pi-tui/theme";
 import {
+	type GlobToolDetails,
+	globToolRenderer,
+} from "@oh-my-pi/pi-tui/tools/glob";
+import {
 	type GrepToolDetails,
 	grepToolRenderer,
 } from "@oh-my-pi/pi-tui/tools/grep";
@@ -213,7 +217,7 @@ test("session_start installs same-name overrides using live schemas and delegate
 	const liveTools = nativeTools();
 	h.getAllTools.mockReturnValue(liveTools);
 	await h.emit("session_start");
-	expect([...h.tools.keys()]).toEqual(["bash", "eval", "grep"]);
+	expect([...h.tools.keys()]).toEqual(["bash", "eval", "grep", "glob"]);
 
 	for (const native of liveTools.slice(0, 2)) {
 		const tool = h.tools.get(native.name)!;
@@ -334,6 +338,83 @@ test("grep delegates native execution, progress and cancellation errors unchange
 	await expect(
 		grep!.execute("g2", params, controller.signal, onUpdate, ctx),
 	).rejects.toBe(failure);
+});
+
+test("glob copies and refreshes live metadata without synthesizing unavailable tools", async () => {
+	const h = harness();
+	expect(h.tools.size).toBe(0);
+	expect(h.getAllTools).not.toHaveBeenCalled();
+	await h.emit("session_start");
+	expect(h.tools.size).toBe(0);
+	const native = nativeTools().find((tool) => tool.name === "glob")!;
+	h.getAllTools.mockReturnValue([native]);
+	await h.emit("session_start");
+	const glob = h.tools.get("glob");
+	expect(glob).toBeDefined();
+	expect(glob!.description).toBe(native.description);
+	expect(glob!.parameters).toBe(native.parameters);
+	expect(glob!.promptGuidelines).toBeUndefined();
+	expect(glob!.label).toBe("Glob");
+	expect(glob!.loadMode).toBe("essential");
+	expect(glob!.approval).toBe("read");
+	expect(glob!.strict).toBe(true);
+	expect(glob).not.toHaveProperty("mergeCallAndResult");
+	native.description = "Updated path search contract";
+	native.parameters = {
+		type: "object",
+		properties: { path: { type: "string" } },
+	} as ToolInfo["parameters"];
+	native.promptGuidelines = ["Use paths to locate files."];
+	await h.emit("session_start");
+	expect(h.tools.get("glob")!.description).toBe(native.description);
+	expect(h.tools.get("glob")!.parameters).toBe(native.parameters);
+	expect(h.tools.get("glob")!.promptGuidelines).toBe(native.promptGuidelines);
+	delete native.promptGuidelines;
+	await h.emit("session_start");
+	expect(h.tools.get("glob")!.promptGuidelines).toBeUndefined();
+});
+
+test("glob delegates identical arguments, streaming updates, cancellation and higher-tier refusal unchanged", async () => {
+	const h = await start();
+	const glob = h.tools.get("glob")!;
+	const params = { path: "src/**/*.ts", hidden: true, limit: 20 };
+	const controller = new AbortController();
+	const onUpdate = mock();
+	const updates = [
+		{ ...nativeResult, details: { fileCount: 1 } },
+		{ ...nativeResult, details: { fileCount: 8 } },
+	];
+	const cancelled = new Error("native glob cancelled");
+	const refusal = new Error(
+		"URL requires exec approval; glob has read approval",
+	);
+	const invokeTool = async (
+		input: unknown,
+		options: { signal: AbortSignal; onUpdate: typeof onUpdate },
+	) => {
+		expect(input).toBe(params);
+		expect(options.signal).toBe(controller.signal);
+		expect(options.onUpdate).toBe(onUpdate);
+		if (options.signal.aborted) throw cancelled;
+		if (params.path.startsWith("ssh://")) throw refusal;
+		for (const update of updates) options.onUpdate(update);
+		return nativeResult;
+	};
+	const ctx = { invokeTool } as unknown as ExtensionContext;
+	expect(
+		await glob.execute("scan", params, controller.signal, onUpdate, ctx),
+	).toBe(nativeResult);
+	expect(onUpdate.mock.calls).toEqual(updates.map((update) => [update]));
+	expect(onUpdate.mock.calls[0][0]).toBe(updates[0]);
+	expect(onUpdate.mock.calls[1][0]).toBe(updates[1]);
+	params.path = "ssh://host/repo/**";
+	await expect(
+		glob.execute("refused", params, controller.signal, onUpdate, ctx),
+	).rejects.toBe(refusal);
+	controller.abort();
+	await expect(
+		glob.execute("cancelled", params, controller.signal, onUpdate, ctx),
+	).rejects.toBe(cancelled);
 });
 
 test("one live summary line counts bash calls across internal turns, prose and non-target tools", async () => {
@@ -1239,6 +1320,63 @@ test.each([
 		["eval", "grep", "bash", "grep", "bash", "eval"],
 		" • Ran 2 bash commands, evaluated 2 cells, grepped 2 patterns",
 	],
+	[["glob"], " • Globbed 1 pattern"],
+	[["glob", "bash"], " • Ran 1 bash command, globbed 1 pattern"],
+	[["glob", "eval"], " • Evaluated 1 cell, globbed 1 pattern"],
+	[["glob", "grep"], " • Grepped 1 pattern, globbed 1 pattern"],
+	[
+		["eval", "glob", "bash"],
+		" • Ran 1 bash command, evaluated 1 cell, globbed 1 pattern",
+	],
+	[
+		["grep", "glob", "bash"],
+		" • Ran 1 bash command, grepped 1 pattern, globbed 1 pattern",
+	],
+	[
+		["glob", "grep", "eval"],
+		" • Evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+	],
+	[
+		["glob", "grep", "eval", "bash"],
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+	],
+	[
+		["bash", "glob", "grep", "eval"],
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+	],
+	[
+		["grep", "eval", "glob", "bash"],
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+	],
+	[["glob", "glob"], " • Globbed 2 patterns"],
+	[
+		["bash", "glob", "glob", "bash"],
+		" • Ran 2 bash commands, globbed 2 patterns",
+	],
+	[
+		["eval", "glob", "eval", "glob"],
+		" • Evaluated 2 cells, globbed 2 patterns",
+	],
+	[
+		["grep", "glob", "glob", "grep"],
+		" • Grepped 2 patterns, globbed 2 patterns",
+	],
+	[
+		["glob", "eval", "bash", "eval", "bash", "glob"],
+		" • Ran 2 bash commands, evaluated 2 cells, globbed 2 patterns",
+	],
+	[
+		["glob", "grep", "bash", "glob", "bash", "grep"],
+		" • Ran 2 bash commands, grepped 2 patterns, globbed 2 patterns",
+	],
+	[
+		["eval", "glob", "grep", "grep", "glob", "eval"],
+		" • Evaluated 2 cells, grepped 2 patterns, globbed 2 patterns",
+	],
+	[
+		["eval", "glob", "grep", "bash", "grep", "glob", "bash", "eval"],
+		" • Ran 2 bash commands, evaluated 2 cells, grepped 2 patterns, globbed 2 patterns",
+	],
 ] as [string[], string][])(
 	"turn group %j has fixed wording and first-call ownership",
 	async (names, expected) => {
@@ -1270,18 +1408,18 @@ test.each([
 	},
 );
 
-test("grep-owned summary line updates after completion across internal turns and isolates new prompts", async () => {
+test("glob-owned summary line updates after completion across internal turns and isolates new prompts", async () => {
 	const h = await start();
-	const first = call("grep", "first");
+	const first = call("glob", "first");
 	expect(summary(h, first)).toBeUndefined();
 	await h.emit("before_agent_start");
 	await record(h, first);
 	const owner = summary(h, first);
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Grepped 1 pattern",
+		" • Globbed 1 pattern",
 	]);
 	await h.emit("tool_result", {
-		toolName: "grep",
+		toolName: "glob",
 		input: first.arguments,
 		...nativeResult,
 	});
@@ -1292,18 +1430,18 @@ test("grep-owned summary line updates after completion across internal turns and
 			text: "Continuing the same prompt",
 		}),
 	});
-	for (const name of ["read", "glob", "web_search"]) {
+	for (const name of ["read", "find", "web_search"]) {
 		await record(h, call(name, name));
 	}
 	await record(h, call("bash", "bash-1"));
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Ran 1 bash command, grepped 1 pattern",
+		" • Ran 1 bash command, globbed 1 pattern",
 	]);
-	for (const name of ["grep", "bash", "eval", "grep"]) {
+	for (const name of ["grep", "bash", "eval", "grep", "grep"]) {
 		await record(h, call(name, `later-${name}`));
 	}
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns",
+		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns, globbed 1 pattern",
 	]);
 	await h.emit("before_agent_start");
 	const next = call("grep", "next");
@@ -1312,11 +1450,11 @@ test("grep-owned summary line updates after completion across internal turns and
 		" • Grepped 1 pattern",
 	]);
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns",
+		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns, globbed 1 pattern",
 	]);
 });
 
-test("grep theme segments restore current counts and muted wording after narrow renders", async () => {
+test("four-tool theme segments restore current counts and muted wording after narrow renders", async () => {
 	const level = chalk.level;
 	chalk.level = 3;
 	try {
@@ -1331,7 +1469,7 @@ test("grep theme segments restore current counts and muted wording after narrow 
 			{ "format.bullet": "◆" },
 		);
 		const h = await start();
-		const first = call("grep", "first");
+		const first = call("glob", "first");
 		await record(h, first);
 		const owner = summary(h, first, customTheme);
 		const dim = (text: string) => customTheme.fg("dim", text);
@@ -1339,9 +1477,18 @@ test("grep theme segments restore current counts and muted wording after narrow 
 		const count = (n: number) =>
 			customTheme.fg("accent", customTheme.bold(String(n)));
 		expect(owner.render(120)).toEqual([
-			` ${dim("◆")} ${muted("Grepped ")}${count(1)}${muted(" pattern")}`,
+			` ${dim("◆")} ${muted("Globbed ")}${count(1)}${muted(" pattern")}`,
 		]);
-		for (const name of ["eval", "grep", "bash", "grep", "eval", "bash"]) {
+		for (const name of [
+			"eval",
+			"grep",
+			"bash",
+			"grep",
+			"eval",
+			"bash",
+			"glob",
+			"grep",
+		]) {
 			await record(h, call(name, name));
 			for (const width of [1, 5, 12, 24]) {
 				const rows = owner.render(width);
@@ -1350,26 +1497,26 @@ test("grep theme segments restore current counts and muted wording after narrow 
 			}
 		}
 		expect(owner.render(120)).toEqual([
-			` ${dim("◆")} ${muted("Ran ")}${count(2)}${muted(" bash commands")}${muted(", ")}${muted("evaluated ")}${count(2)}${muted(" cells")}${muted(", ")}${muted("grepped ")}${count(3)}${muted(" patterns")}`,
+			` ${dim("◆")} ${muted("Ran ")}${count(2)}${muted(" bash commands")}${muted(", ")}${muted("evaluated ")}${count(2)}${muted(" cells")}${muted(", ")}${muted("grepped ")}${count(3)}${muted(" patterns")}${muted(", ")}${muted("globbed ")}${count(2)}${muted(" patterns")}`,
 		]);
 		expect(stripVTControlCharacters(owner.render(120)[0])).toBe(
-			" ◆ Ran 2 bash commands, evaluated 2 cells, grepped 3 patterns",
+			" ◆ Ran 2 bash commands, evaluated 2 cells, grepped 3 patterns, globbed 2 patterns",
 		);
 	} finally {
 		chalk.level = level;
 	}
 });
 
-test("grep branch fallback replays initial, empty, grep-only and mixed user turn groups by argument identity", async () => {
+test("four-tool branch fallback replays initial, empty, glob-only and mixed user turn groups by argument identity", async () => {
 	const h = harness();
-	const initial = call("grep", "initial");
+	const initial = call("glob", "initial");
 	h.sessionManager.appendMessage(assistantMessage(initial));
 	h.sessionManager.appendMessage({
 		role: "user",
 		content: "Search twice",
 		timestamp: 1,
 	});
-	const searches = [call("grep", "g1"), call("grep", "g2")];
+	const searches = [call("glob", "g1"), call("glob", "g2")];
 	expect(searches[0].arguments).toEqual(searches[1].arguments);
 	expect(searches[0].arguments).not.toBe(searches[1].arguments);
 	h.sessionManager.appendMessage(
@@ -1391,43 +1538,46 @@ test("grep branch fallback replays initial, empty, grep-only and mixed user turn
 		timestamp: 3,
 	});
 	const mixed = [
+		call("glob", "glob-first"),
 		call("grep", "g3"),
 		call("eval", "e1"),
 		call("bash", "b1"),
 		call("grep", "g4"),
 	];
 	h.sessionManager.appendMessage(
-		assistantMessage(...mixed, call("glob", "glob")),
+		assistantMessage(...mixed, call("find", "find")),
 	);
 	await start(h);
 	expect(summary(h, initial).render(120).map(stripVTControlCharacters)).toEqual(
-		[" • Grepped 1 pattern"],
+		[" • Globbed 1 pattern"],
 	);
 	expect(
 		summary(h, searches[0]).render(120).map(stripVTControlCharacters),
-	).toEqual([" • Grepped 2 patterns"]);
+	).toEqual([" • Globbed 2 patterns"]);
 	expect(
 		summary(h, mixed[0]).render(120).map(stripVTControlCharacters),
-	).toEqual([" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns"]);
+	).toEqual([
+		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns, globbed 1 pattern",
+	]);
 	for (const item of [searches[1], ...mixed.slice(1)]) {
 		expect(summary(h, item)).toBeUndefined();
 	}
-	expect(summary(h, call("grep", "equal-but-unknown"))).toBeUndefined();
+	expect(summary(h, call("glob", "equal-but-unknown"))).toBeUndefined();
 });
 
-test("grep branch fallback refreshes held summary lines on message_end and read-only tool_result", async () => {
+test("four-tool branch fallback refreshes held summary lines on message_end and read-only tool_result", async () => {
 	const h = harness();
 	h.sessionManager.appendMessage({
 		role: "user",
 		content: "Search",
 		timestamp: 1,
 	});
-	const first = call("grep", "first");
+	const first = call("glob", "first");
 	h.sessionManager.appendMessage(assistantMessage(first));
 	await start(h);
 	const owner = summary(h, first);
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Grepped 1 pattern",
+		" • Globbed 1 pattern",
 	]);
 	const message = assistantMessage(
 		call("bash", "b1"),
@@ -1437,18 +1587,18 @@ test("grep branch fallback refreshes held summary lines on message_end and read-
 	h.sessionManager.appendMessage(message);
 	await h.emit("message_end", { message });
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
 	]);
-	const third = call("grep", "g3");
+	const third = call("glob", "g3");
 	h.sessionManager.appendMessage(assistantMessage(third));
 	const result = {
-		toolName: "grep",
+		toolName: "glob",
 		toolCallId: third.id,
 		input: third.arguments,
 		content: Object.freeze([
 			{ type: "text", text: "full model-visible search output" },
 		]),
-		details: Object.freeze({ matches: 12 }),
+		details: Object.freeze({ fileCount: 12 }),
 		isError: false,
 	};
 	const before = structuredClone(result);
@@ -1456,13 +1606,13 @@ test("grep branch fallback refreshes held summary lines on message_end and read-
 		expect(await h.emit("tool_result", Object.freeze(result))).toBeUndefined();
 		expect(result).toEqual(before);
 		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-			" • Ran 1 bash command, evaluated 1 cell, grepped 3 patterns",
+			" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 2 patterns",
 		]);
 		expect(summary(h, third)).toBeUndefined();
 	}
 });
 
-test("grep reconciles active-live, branch and retained-live membership without crossing prompts", async () => {
+test("four-tool groups reconcile active-live, branch and retained-live membership without crossing prompts", async () => {
 	const h = await start();
 	await h.emit("before_agent_start");
 	h.sessionManager.appendMessage({
@@ -1470,7 +1620,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 		content: "First prompt",
 		timestamp: 1,
 	});
-	const first = call("grep", "first");
+	const first = call("glob", "first");
 	const second = call("eval", "second");
 	const third = call("grep", "third");
 	await record(h, first);
@@ -1478,7 +1628,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 	h.sessionManager.appendMessage(assistantMessage(first, second));
 	await h.emit("message_end");
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Grepped 1 pattern",
+		" • Globbed 1 pattern",
 	]);
 	await record(h, second);
 	await record(h, third);
@@ -1490,11 +1640,15 @@ test("grep reconciles active-live, branch and retained-live membership without c
 			...nativeResult,
 		});
 		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-			" • Evaluated 1 cell, grepped 2 patterns",
+			" • Evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
 		]);
 	}
 	h.sessionManager.appendMessage(
-		assistantMessage(third, call("bash", "persisted-only")),
+		assistantMessage(
+			third,
+			call("bash", "persisted-only"),
+			call("glob", "persisted-glob"),
+		),
 	);
 	await h.emit("tool_result", {
 		toolName: "grep",
@@ -1502,7 +1656,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 		...nativeResult,
 	});
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Evaluated 1 cell, grepped 2 patterns",
+		" • Evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
 	]);
 	await h.emit("before_agent_start");
 	h.sessionManager.appendMessage({
@@ -1514,7 +1668,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 	await record(h, next);
 	const nextOwner = summary(h, next);
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 2 patterns",
 	]);
 	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
 		" • Grepped 1 pattern",
@@ -1525,7 +1679,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 	h.sessionManager.getBranch = () => [];
 	await h.emit("tool_result");
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Evaluated 1 cell, grepped 2 patterns",
+		" • Evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
 	]);
 	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
 		" • Grepped 1 pattern",
@@ -1533,7 +1687,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 	h.sessionManager.getBranch = getBranch;
 	await h.emit("message_end");
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns",
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 2 patterns",
 	]);
 	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
 		" • Grepped 1 pattern",
@@ -1542,7 +1696,7 @@ test("grep reconciles active-live, branch and retained-live membership without c
 
 function searchResult(
 	text: string,
-	details: GrepToolDetails = {},
+	details: GrepToolDetails | GlobToolDetails = {},
 	isError = false,
 ) {
 	return { content: [{ type: "text" as const, text }], details, isError };
@@ -1559,6 +1713,30 @@ const grepResults = [
 	searchResult("model detail", { error: "native detailed failure" }),
 ];
 
+const globResults = [
+	searchResult("src/one.ts", { fileCount: 1, files: ["src/one.ts"] }),
+	searchResult("src/one.ts\nsrc/two.ts", {
+		fileCount: 2,
+		files: ["src/one.ts", "src/two.ts"],
+		scopePath: "src",
+	}),
+	searchResult("limited scan", {
+		fileCount: 2,
+		files: ["src/one.ts", "src/two.ts"],
+		truncated: true,
+		resultLimitReached: 2,
+		missingPaths: ["missing"],
+	}),
+	searchResult("No files found", { fileCount: 0, files: [] }),
+	searchResult("Scan timed out", { fileCount: 0, files: [], timedOut: true }),
+	searchResult("Legacy timeout", { fileCount: 0, files: [], truncated: true }),
+	searchResult("No files matching pattern"),
+	searchResult(""),
+	searchResult("legacy/one.ts\nlegacy/two.ts"),
+	searchResult("native glob failure", {}, true),
+	searchResult("model detail", { error: "native detailed glob failure" }),
+];
+
 function host(h: ReturnType<typeof harness>, item: Call, native = false) {
 	return new ToolExecutionComponent(
 		item.name,
@@ -1573,68 +1751,153 @@ function host(h: ReturnType<typeof harness>, item: Call, native = false) {
 	);
 }
 
-test("expanded grep restores native matches, empty and error results for first and later live and replayed calls", async () => {
-	const level = chalk.level;
-	chalk.level = 3;
-	try {
-		for (const replay of [false, true]) {
-			const h = harness();
-			const calls = [call("grep", "first"), call("grep", "later")];
-			const args = {
-				pattern: "needle.*",
-				paths: ["src", "tests"],
-				case: false,
-				skip: 2,
-			};
-			for (const item of calls) item.arguments = { ...args };
-			if (replay) h.sessionManager.appendMessage(assistantMessage(...calls));
-			await start(h);
-			if (!replay) for (const item of calls) await record(h, item);
-			for (let toggle = 0; toggle < 2; toggle++) {
-				for (const item of calls) {
-					const tool = h.tools.get("grep")!;
-					for (const result of grepResults) {
-						for (const isPartial of [true, false]) {
-							const options = { expanded: true, isPartial };
-							expect(
-								tool.renderCall!(item.arguments, options, theme),
-							).toBeUndefined();
-							const actual = tool.renderResult!(
-								result,
-								options,
-								theme,
-								item.arguments,
-							);
-							const native = grepToolRenderer.renderResult(
-								result,
-								options,
-								theme,
-								args,
-							);
-							for (const width of [100, 18, 100]) {
-								expect(actual.render(width)).toEqual(native.render(width));
-							}
-							expect(
-								tool.renderResult!(
+async function mountTurnGroup(
+	names: string[],
+	replay: boolean,
+	fullWidth: number,
+) {
+	const h = harness();
+	const calls = names.map((name, index) => call(name, `host-${index}`));
+	if (replay) {
+		h.sessionManager.appendMessage({
+			role: "user",
+			content: "Saved search",
+			timestamp: 1,
+		});
+		h.sessionManager.appendMessage(assistantMessage(...calls));
+	}
+	await start(h);
+	const cards: ToolExecutionComponent[] = [];
+	for (const item of calls) {
+		const card = host(h, item);
+		if (!replay) {
+			expect(trimBlankEdges(card.render(fullWidth))).toHaveLength(0);
+			await record(h, item);
+		}
+		card.setArgsComplete();
+		card.setExecutionStarted();
+		cards.push(card);
+	}
+	return { h, calls, cards };
+}
+
+function expectCollapsedTurnGroup(
+	cards: ToolExecutionComponent[],
+	expected: string,
+	width: number,
+	fullWidth: number,
+) {
+	for (const [index, card] of cards.entries()) {
+		const rows = trimBlankEdges(card.render(width));
+		expect(rows).toHaveLength(index === 0 ? 1 : 0);
+		if (index === 0) {
+			expect(visibleWidth(rows[0])).toBeLessThanOrEqual(width);
+			if (width === fullWidth)
+				expect(stripVTControlCharacters(rows[0])).toBe(
+					expected.padEnd(fullWidth),
+				);
+		}
+		expectNoStateBg(rows.join("\n"));
+	}
+}
+
+function expectExpandedHostResult(
+	h: ReturnType<typeof harness>,
+	item: Call,
+	card: ToolExecutionComponent,
+	result: ReturnType<typeof searchResult>,
+	fullWidth: number,
+	isPartial = false,
+) {
+	card.setTranscriptAllocation(fullWidth, { tick: 0, now: 0 });
+	card.setExpanded(true);
+	if (item.name === "grep" || item.name === "glob") {
+		const native = host(h, item, true);
+		native.setArgsComplete();
+		native.setExecutionStarted();
+		native.updateResult(result, isPartial);
+		native.setExpanded(true);
+		native.setTranscriptAllocation(fullWidth, { tick: 0, now: 0 });
+		for (const width of [fullWidth, 18, fullWidth]) {
+			const rows = trimBlankEdges(card.render(width));
+			expect(rows).toEqual(trimBlankEdges(native.render(width)));
+			expectNoStateBg(rows.join("\n"));
+		}
+	} else {
+		expect(card.render(fullWidth).join("\n")).toContain("native output");
+	}
+	card.setExpanded(false);
+	card.setTranscriptAllocation(1, { tick: 0, now: 0 });
+}
+
+test.each([
+	["grep", grepResults, grepToolRenderer, " • Grepped 2 patterns"],
+	["glob", globResults, globToolRenderer, " • Globbed 2 patterns"],
+] as const)(
+	"expanded %s restores native partial, normal, empty and error results for first and later live and replayed calls",
+	async (name, results, renderer, expectedSummary) => {
+		const level = chalk.level;
+		chalk.level = 3;
+		try {
+			for (const replay of [false, true]) {
+				const h = harness();
+				const calls = [call(name, "first"), call(name, "later")];
+				const args = {
+					pattern: "needle.*",
+					paths: ["src", "tests"],
+					case: false,
+					skip: 2,
+				};
+				for (const item of calls) item.arguments = { ...args };
+				if (replay) h.sessionManager.appendMessage(assistantMessage(...calls));
+				await start(h);
+				if (!replay) for (const item of calls) await record(h, item);
+				for (let toggle = 0; toggle < 2; toggle++) {
+					for (const item of calls) {
+						const tool = h.tools.get(name)!;
+						for (const result of results) {
+							for (const isPartial of [true, false]) {
+								const options = { expanded: true, isPartial };
+								expect(
+									tool.renderCall!(item.arguments, options, theme),
+								).toBeUndefined();
+								const actual = tool.renderResult!(
 									result,
-									{ ...collapsed, isPartial },
+									options,
 									theme,
 									item.arguments,
-								),
-							).toBeUndefined();
+								);
+								const native = renderer.renderResult(
+									result,
+									options,
+									theme,
+									args,
+								);
+								for (const width of [100, 18, 100]) {
+									expect(actual.render(width)).toEqual(native.render(width));
+								}
+								expect(
+									tool.renderResult!(
+										result,
+										{ ...collapsed, isPartial },
+										theme,
+										item.arguments,
+									),
+								).toBeUndefined();
+							}
 						}
 					}
+					expect(
+						summary(h, calls[0]).render(100).map(stripVTControlCharacters),
+					).toEqual([expectedSummary]);
+					expect(summary(h, calls[1])).toBeUndefined();
 				}
-				expect(
-					summary(h, calls[0]).render(100).map(stripVTControlCharacters),
-				).toEqual([" • Grepped 2 patterns"]);
-				expect(summary(h, calls[1])).toBeUndefined();
 			}
+		} finally {
+			chalk.level = level;
 		}
-	} finally {
-		chalk.level = level;
-	}
-});
+	},
+);
 
 test.each([false, true])(
 	"real host preserves grep inline layout and one-row turn groups through expansion and resize (replay=%s)",
@@ -1653,42 +1916,9 @@ test.each([false, true])(
 					" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern",
 				],
 			] as [string[], string][]) {
-				const h = harness();
-				const calls = names.map((name, index) => call(name, `host-${index}`));
-				if (replay) {
-					h.sessionManager.appendMessage({
-						role: "user",
-						content: "Saved search",
-						timestamp: 1,
-					});
-					h.sessionManager.appendMessage(assistantMessage(...calls));
-				}
-				await start(h);
-				const cards = [] as ToolExecutionComponent[];
-				for (const item of calls) {
-					const card = host(h, item);
-					if (!replay) {
-						expect(trimBlankEdges(card.render(100))).toHaveLength(0);
-						await record(h, item);
-					}
-					card.setArgsComplete();
-					card.setExecutionStarted();
-					cards.push(card);
-				}
-				const checkCollapsed = (width: number) => {
-					for (const [index, card] of cards.entries()) {
-						const rows = trimBlankEdges(card.render(width));
-						expect(rows).toHaveLength(index === 0 ? 1 : 0);
-						if (index === 0) {
-							expect(visibleWidth(rows[0])).toBeLessThanOrEqual(width);
-							if (width === 100)
-								expect(stripVTControlCharacters(rows[0])).toBe(
-									expected.padEnd(width),
-								);
-						}
-						expectNoStateBg(rows.join("\n"));
-					}
-				};
+				const { h, calls, cards } = await mountTurnGroup(names, replay, 100);
+				const checkCollapsed = (width: number) =>
+					expectCollapsedTurnGroup(cards, expected, width, 100);
 				checkCollapsed(100);
 				for (const card of cards)
 					card.setTranscriptAllocation(1, { tick: 0, now: 0 });
@@ -1704,25 +1934,79 @@ test.each([false, true])(
 					checkCollapsed(100);
 					for (let toggle = 0; toggle < 2; toggle++) {
 						for (const [index, card] of cards.entries()) {
-							card.setTranscriptAllocation(100, { tick: 0, now: 0 });
-							card.setExpanded(true);
-							if (calls[index].name === "grep") {
-								const native = host(h, calls[index], true);
-								native.setArgsComplete();
-								native.updateResult(result);
-								native.setExpanded(true);
-								native.setTranscriptAllocation(100, { tick: 0, now: 0 });
-								for (const width of [100, 18, 100]) {
-									const rows = trimBlankEdges(card.render(width));
-									expect(rows).toEqual(trimBlankEdges(native.render(width)));
-									expectNoStateBg(rows.join("\n"));
-								}
-							}
-							card.setExpanded(false);
-							card.setTranscriptAllocation(1, { tick: 0, now: 0 });
+							expectExpandedHostResult(
+								h,
+								calls[index],
+								card,
+								calls[index].name === "grep"
+									? result
+									: { ...nativeResult, isError: false },
+								100,
+							);
 						}
 						checkCollapsed(18);
 						checkCollapsed(100);
+					}
+				}
+			}
+		} finally {
+			chalk.level = level;
+		}
+	},
+);
+
+test.each([false, true])(
+	"real host keeps glob streaming groups compact and native expansion inline (replay=%s)",
+	async (replay) => {
+		const level = chalk.level;
+		chalk.level = 3;
+		try {
+			for (const names of [
+				["glob", "grep", "eval", "bash", "glob"],
+				["bash", "glob", "eval", "grep", "glob"],
+			]) {
+				const { h, calls, cards } = await mountTurnGroup(names, replay, 120);
+				const expected =
+					" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 2 patterns";
+				const checkCollapsed = (width: number) =>
+					expectCollapsedTurnGroup(cards, expected, width, 120);
+				checkCollapsed(120);
+				for (const card of cards)
+					card.setTranscriptAllocation(1, { tick: 0, now: 0 });
+				checkCollapsed(120);
+				const updates: [ReturnType<typeof searchResult>, boolean][] = [
+					[globResults[0], true],
+					[globResults[1], true],
+					...globResults.map((result): [typeof result, boolean] => [
+						result,
+						false,
+					]),
+				];
+				for (const [result, isPartial] of updates) {
+					for (const [index, card] of cards.entries()) {
+						card.updateResult(
+							calls[index].name === "glob"
+								? result
+								: { ...nativeResult, isError: false },
+							isPartial,
+						);
+					}
+					checkCollapsed(120);
+					for (let toggle = 0; toggle < 2; toggle++) {
+						for (const [index, card] of cards.entries()) {
+							expectExpandedHostResult(
+								h,
+								calls[index],
+								card,
+								calls[index].name === "glob"
+									? result
+									: { ...nativeResult, isError: false },
+								120,
+								isPartial,
+							);
+						}
+						checkCollapsed(18);
+						checkCollapsed(120);
 					}
 				}
 			}

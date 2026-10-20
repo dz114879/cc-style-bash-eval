@@ -3,16 +3,23 @@ import { type Component, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { markFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 
-export type TrackedToolName = "bash" | "eval" | "grep";
+export type TrackedToolName = "bash" | "eval" | "grep" | "glob";
 
 export function isTrackedToolName(name: string): name is TrackedToolName {
-	return name === "bash" || name === "eval" || name === "grep";
+	return (
+		name === "bash" || name === "eval" || name === "grep" || name === "glob"
+	);
 }
 
 interface TurnGroup {
 	bash: number;
 	eval: number;
 	grep: number;
+	glob: number;
+}
+
+function emptyTurnGroup(): TurnGroup {
+	return { bash: 0, eval: 0, grep: 0, glob: 0 };
 }
 
 interface TurnGroupSummary extends TurnGroup {
@@ -21,7 +28,7 @@ interface TurnGroupSummary extends TurnGroup {
 }
 
 export class TurnGroups {
-	private current: TurnGroup = { bash: 0, eval: 0, grep: 0 };
+	private current: TurnGroup = emptyTurnGroup();
 	private readonly calls = new WeakMap<
 		object,
 		{ group: TurnGroup; index: number }
@@ -31,16 +38,14 @@ export class TurnGroups {
 	rebuild(entries: readonly SessionEntry[]): void {
 		const groups: (TurnGroup & { calls: object[] })[] = [];
 		let group: TurnGroup & { calls: object[] } = {
-			bash: 0,
-			eval: 0,
-			grep: 0,
+			...emptyTurnGroup(),
 			calls: [],
 		};
 		groups.push(group);
 		for (const entry of entries) {
 			if (entry.type !== "message") continue;
 			if (entry.message.role === "user") {
-				group = { bash: 0, eval: 0, grep: 0, calls: [] };
+				group = { ...emptyTurnGroup(), calls: [] };
 				groups.push(group);
 			} else if (entry.message.role === "assistant") {
 				for (const content of entry.message.content) {
@@ -52,20 +57,27 @@ export class TurnGroups {
 			}
 		}
 		this.branch = new WeakMap();
-		for (const [turn, { bash, eval: cells, grep, calls }] of groups.entries()) {
+		for (const [
+			turn,
+			{ bash, eval: cells, grep, glob, calls },
+		] of groups.entries()) {
 			for (const [index, input] of calls.entries()) {
-				this.branch.set(input, { turn, index, bash, eval: cells, grep });
+				this.branch.set(input, { turn, index, bash, eval: cells, grep, glob });
 			}
 		}
 	}
 
 	startPrompt(): void {
-		this.current = { bash: 0, eval: 0, grep: 0 };
+		this.current = emptyTurnGroup();
 	}
 
 	record(toolName: string, input: object): void {
 		if (!isTrackedToolName(toolName)) return;
-		const index = this.current.bash + this.current.eval + this.current.grep;
+		const index =
+			this.current.bash +
+			this.current.eval +
+			this.current.grep +
+			this.current.glob;
 		this.current[toolName]++;
 		this.calls.set(input, { group: this.current, index });
 	}
@@ -117,6 +129,13 @@ export class TurnGroups {
 					group.grep,
 					"Grepped ",
 					"grepped ",
+					" pattern",
+					" patterns",
+				);
+				appendClause(
+					group.glob,
+					"Globbed ",
+					"globbed ",
 					" pattern",
 					" patterns",
 				);

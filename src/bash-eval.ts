@@ -4,6 +4,7 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { markFramedBlockComponent, toPathList } from "@oh-my-pi/pi-tui/render";
 import { bashToolRenderer } from "@oh-my-pi/pi-tui/tools/bash";
 import { evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
+import { globToolRenderer } from "@oh-my-pi/pi-tui/tools/glob";
 import { grepToolRenderer } from "@oh-my-pi/pi-tui/tools/grep";
 import {
 	isTrackedToolName,
@@ -67,6 +68,21 @@ const toolDescriptors: Record<
 					options,
 					theme,
 					args as Parameters<typeof grepToolRenderer.renderResult>[3],
+				),
+			);
+		},
+	},
+	glob: {
+		label: "Glob",
+		approval: "read",
+		loadMode: "essential",
+		renderResult(result, options, theme, args) {
+			return markFramedBlockComponent(
+				globToolRenderer.renderResult(
+					result as Parameters<typeof globToolRenderer.renderResult>[0],
+					options,
+					theme,
+					args as Parameters<typeof globToolRenderer.renderResult>[3],
 				),
 			);
 		},
