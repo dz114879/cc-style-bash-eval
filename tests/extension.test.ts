@@ -53,6 +53,7 @@ function harness() {
 	const handlers = new Map<string, Handler[]>();
 	const sessionManager = SessionManager.inMemory();
 	const getAllTools = mock((): ToolInfo[] => []);
+	let generatedCallId = 0;
 	const api = {
 		getAllTools,
 		registerTool(tool: RegisteredTool) {
@@ -70,9 +71,18 @@ function harness() {
 		async emit(type: string, event: Record<string, unknown> = {}) {
 			let result: unknown;
 			for (const handler of handlers.get(type) ?? []) {
-				result = await handler({ type, ...event }, {
-					sessionManager,
-				} as unknown as ExtensionContext);
+				result = await handler(
+					{
+						type,
+						...(type === "tool_call"
+							? { toolCallId: `generated-${generatedCallId++}` }
+							: {}),
+						...event,
+					},
+					{
+						sessionManager,
+					} as unknown as ExtensionContext,
+				);
 			}
 			return result;
 		},
@@ -417,64 +427,54 @@ test("glob delegates identical arguments, streaming updates, cancellation and hi
 	).rejects.toBe(cancelled);
 });
 
-test("one live summary line counts bash calls across internal turns, prose and non-target tools", async () => {
-	const h = harness();
-	h.getAllTools.mockReturnValue(nativeTools());
-	await h.emit("session_start");
+test("live summaries split at prose and direct untracked calls while internal turns preserve a run", async () => {
+	const h = await start();
 	await h.emit("before_agent_start");
-	const bash = h.tools.get("bash")!;
-	const first = { command: "echo first" };
-	await h.emit("tool_call", {
-		toolName: "bash",
-		toolCallId: "b1",
-		input: first,
-	});
-	const summary = bash.renderCall?.(first, collapsed, theme);
-	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
-		" • Ran 1 bash command",
-	]);
-	const narrowSummary = summary!.render(10);
-	expect(narrowSummary).toHaveLength(1);
-	expect(visibleWidth(narrowSummary[0])).toBeLessThanOrEqual(10);
-	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
-		" • Ran 1 bash command",
-	]);
-	expect(
-		bash.renderResult?.(nativeResult, collapsed, theme, first),
-	).toBeUndefined();
-
+	const first = call("bash", "first");
+	await record(h, first);
+	const owner = summary(h, first);
 	await h.emit("turn_start");
 	await h.emit("message_end", {
-		message: {
-			role: "assistant",
-			content: [{ type: "text", text: "Continuing" }],
-		},
+		message: assistantMessage(
+			{ type: "thinking", thinking: "Considering the next call" },
+			{ type: "text", text: " \n\t" },
+		),
 	});
-	await h.emit("tool_call", {
-		toolName: "read",
-		toolCallId: "r1",
-		input: { path: "sample.txt" },
-	});
-	const second = { command: "echo second" };
-	await h.emit("tool_call", {
-		toolName: "bash",
-		toolCallId: "b2",
-		input: second,
-	});
-	expect(summary?.render(100).map(stripVTControlCharacters)).toEqual([
-		" • Ran 2 bash commands",
+	const second = call("eval", "second");
+	await record(h, second);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command, evaluated 1 cell",
 	]);
-	for (let repaint = 0; repaint < 2; repaint++) {
-		expect(bash.renderCall?.(second, collapsed, theme)).toBeUndefined();
-		expect(
-			bash.renderResult?.(nativeResult, collapsed, theme, second),
-		).toBeUndefined();
-		expect(
-			bash
-				.renderCall?.(first, collapsed, theme)
-				?.render(100)
-				.map(stripVTControlCharacters),
-		).toEqual([" • Ran 2 bash commands"]);
+	expect(summary(h, second)).toBeUndefined();
+	await h.emit("message_end", {
+		message: assistantMessage({ type: "text", text: "第一句" }),
+	});
+	const third = call("grep", "third");
+	await record(h, third);
+	expect(summary(h, third)?.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern",
+	]);
+	await record(h, call("read", "read"));
+	const fourth = call("glob", "fourth");
+	await record(h, fourth);
+	expect(summary(h, fourth)?.render(120).map(stripVTControlCharacters)).toEqual(
+		[" • Globbed 1 pattern"],
+	);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command, evaluated 1 cell",
+	]);
+	for (const item of [first, second, third, fourth]) {
+		const tool = h.tools.get(item.name)!;
+		for (const isPartial of [true, false]) {
+			expect(
+				tool.renderResult!(
+					nativeResult,
+					{ ...collapsed, isPartial },
+					theme,
+					item.arguments,
+				),
+			).toBeUndefined();
+		}
 	}
 });
 
@@ -711,13 +711,8 @@ test("branch fallback resumes one summary line per user turn across bash, eval a
 			h.sessionManager.appendMessage(
 				assistantMessage(
 					{ type: "toolCall", id: `${turn}-${index}`, ...call },
-					{ type: "text", text: "Continuing this user turn" },
-					{
-						type: "toolCall",
-						id: `read-${turn}-${index}`,
-						name: "read",
-						arguments: { path: "sample.txt" },
-					},
+					{ type: "text", text: " \t" },
+					{ type: "thinking", thinking: "Continuing this run" },
 				),
 			);
 		}
@@ -1427,18 +1422,21 @@ test("glob-owned summary line updates after completion across internal turns and
 	await h.emit("message_end", {
 		message: assistantMessage({
 			type: "text",
-			text: "Continuing the same prompt",
+			text: " \n\t",
 		}),
 	});
-	for (const name of ["read", "find", "web_search"]) {
-		await record(h, call(name, name));
-	}
 	await record(h, call("bash", "bash-1"));
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
 		" • Ran 1 bash command, globbed 1 pattern",
 	]);
-	for (const name of ["grep", "bash", "eval", "grep", "grep"]) {
-		await record(h, call(name, `later-${name}`));
+	for (const [index, name] of [
+		"grep",
+		"bash",
+		"eval",
+		"grep",
+		"grep",
+	].entries()) {
+		await record(h, call(name, `later-${index}`));
 	}
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
 		" • Ran 2 bash commands, evaluated 1 cell, grepped 3 patterns, globbed 1 pattern",
@@ -1479,7 +1477,7 @@ test("four-tool theme segments restore current counts and muted wording after na
 		expect(owner.render(120)).toEqual([
 			` ${dim("◆")} ${muted("Globbed ")}${count(1)}${muted(" pattern")}`,
 		]);
-		for (const name of [
+		for (const [index, name] of [
 			"eval",
 			"grep",
 			"bash",
@@ -1488,8 +1486,8 @@ test("four-tool theme segments restore current counts and muted wording after na
 			"bash",
 			"glob",
 			"grep",
-		]) {
-			await record(h, call(name, name));
+		].entries()) {
+			await record(h, call(name, `theme-${index}`));
 			for (const width of [1, 5, 12, 24]) {
 				const rows = owner.render(width);
 				expect(rows).toHaveLength(1);
@@ -1551,15 +1549,16 @@ test("four-tool branch fallback replays initial, empty, glob-only and mixed user
 	expect(summary(h, initial).render(120).map(stripVTControlCharacters)).toEqual(
 		[" • Globbed 1 pattern"],
 	);
-	expect(
-		summary(h, searches[0]).render(120).map(stripVTControlCharacters),
-	).toEqual([" • Globbed 2 patterns"]);
+	for (const item of searches)
+		expect(summary(h, item)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Globbed 1 pattern"],
+		);
 	expect(
 		summary(h, mixed[0]).render(120).map(stripVTControlCharacters),
 	).toEqual([
 		" • Ran 1 bash command, evaluated 1 cell, grepped 2 patterns, globbed 1 pattern",
 	]);
-	for (const item of [searches[1], ...mixed.slice(1)]) {
+	for (const item of mixed.slice(1)) {
 		expect(summary(h, item)).toBeUndefined();
 	}
 	expect(summary(h, call("glob", "equal-but-unknown"))).toBeUndefined();
@@ -1679,7 +1678,7 @@ test("four-tool groups reconcile active-live, branch and retained-live membershi
 	h.sessionManager.getBranch = () => [];
 	await h.emit("tool_result");
 	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
-		" • Evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+		" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 2 patterns",
 	]);
 	expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
 		" • Grepped 1 pattern",
@@ -2015,3 +2014,400 @@ test.each([false, true])(
 		}
 	},
 );
+
+test.each(["message_update", "assistant_message", "both"])(
+	"live %s observations split before, between and after calls without replaying boundaries",
+	async (source) => {
+		const h = await start();
+		const earlier = call("bash", "earlier");
+		await record(h, earlier);
+		const earlierOwner = summary(h, earlier);
+		const observe = async (message: ReturnType<typeof assistantMessage>) => {
+			if (source !== "assistant_message")
+				await h.emit("message_update", { message: structuredClone(message) });
+			if (source !== "message_update")
+				await h.emit("assistant_message", {
+					message: structuredClone(message),
+				});
+		};
+		await observe(assistantMessage({ type: "text", text: "Earlier prose" }));
+		const groups = [
+			[call("glob", "g1"), call("bash", "b1")],
+			[call("eval", "e1"), call("grep", "s1")],
+			[call("grep", "s2"), call("glob", "g2")],
+		];
+		const read = call("read", "read");
+		const message = assistantMessage(
+			{ type: "text", text: "Before the first call" },
+			groups[0][0],
+			{ type: "thinking", thinking: "No boundary" },
+			{ type: "text", text: " \n\t" },
+			groups[0][1],
+			{ type: "text", text: "Between the runs" },
+			...groups[1],
+			read,
+			...groups[2],
+			{ type: "text", text: "After the last call" },
+		);
+		await observe(message);
+		const owners = [];
+		for (const item of [...groups[0], ...groups[1], read, ...groups[2]]) {
+			await record(h, item);
+			if (groups.some((group) => group[0] === item))
+				owners.push(summary(h, item));
+		}
+		const expected = [
+			" • Ran 1 bash command, globbed 1 pattern",
+			" • Evaluated 1 cell, grepped 1 pattern",
+			" • Grepped 1 pattern, globbed 1 pattern",
+		];
+		for (const [index, owner] of owners.entries())
+			expect(owner?.render(120).map(stripVTControlCharacters)).toEqual([
+				expected[index],
+			]);
+		for (const group of groups) expect(summary(h, group[1])).toBeUndefined();
+		h.sessionManager.appendMessage(message);
+		await h.emit("message_end", { message: structuredClone(message) });
+		await h.emit("message_end", { message });
+		const next = call("bash", "after-trailing-prose");
+		await record(h, next);
+		// A duplicate event/snapshot must not close the next run or count again.
+		await record(h, read);
+		await h.emit("message_end", { message });
+		await record(h, next);
+		const last = call("eval", "last");
+		await record(h, last);
+		expect(summary(h, next)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Ran 1 bash command, evaluated 1 cell"],
+		);
+		expect(summary(h, last)).toBeUndefined();
+		expect(earlierOwner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 bash command",
+		]);
+	},
+);
+
+test.each(["prose", "untracked"])(
+	"branch reconciliation retains groups closed by %s against lagging snapshots and adopts only their fuller batches",
+	async (boundary) => {
+		const h = await start();
+		const first = [
+			call("glob", "closed-g"),
+			call("eval", "closed-e"),
+			call("grep", "closed-s"),
+		];
+		for (const item of first) await record(h, item);
+		const owner = summary(h, first[0]);
+		const separator =
+			boundary === "prose"
+				? { type: "text" as const, text: "Mid-prompt boundary" }
+				: call("write", "boundary-write");
+		if (separator.type === "text")
+			await h.emit("assistant_message", {
+				message: assistantMessage(separator),
+			});
+		else await record(h, separator);
+		const next = call("bash", "active-b");
+		await record(h, next);
+		const nextOwner = summary(h, next);
+		const persistedOnly = call("glob", "interrupted-batch");
+		const activeAhead = call("eval", "active-ahead");
+		const snapshot = (calls: Call[], extra: Call[] = []) => {
+			const manager = SessionManager.inMemory();
+			manager.appendMessage(
+				assistantMessage(
+					...structuredClone(calls),
+					separator,
+					...structuredClone([next, ...extra]),
+				),
+			);
+			return manager.getBranch();
+		};
+		let entries = snapshot(first.slice(0, 2));
+		h.sessionManager.getBranch = () => entries;
+		for (const event of ["message_end", "tool_result"]) {
+			await h.emit(event);
+			expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+				" • Evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+			]);
+			expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+				" • Ran 1 bash command",
+			]);
+		}
+		entries = snapshot([...first, persistedOnly], [activeAhead]);
+		for (let rebuild = 0; rebuild < 2; rebuild++) {
+			await h.emit("tool_result");
+			expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+				" • Evaluated 1 cell, grepped 1 pattern, globbed 2 patterns",
+			]);
+			expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+				" • Ran 1 bash command",
+			]);
+		}
+		await h.emit("before_agent_start");
+		expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 bash command, evaluated 1 cell",
+		]);
+		entries = snapshot(first.slice(0, 1));
+		await h.emit("message_end");
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Evaluated 1 cell, grepped 1 pattern, globbed 2 patterns",
+		]);
+		expect(nextOwner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 bash command, evaluated 1 cell",
+		]);
+		const last = call("grep", "new-prompt");
+		await record(h, last);
+		expect(summary(h, last)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Grepped 1 pattern"],
+		);
+	},
+);
+
+test.each([false, true])(
+	"real host preserves every split group's chronological owner across streaming, resize and expansion (replay=%s)",
+	async (replay) => {
+		const level = chalk.level;
+		chalk.level = 3;
+		try {
+			for (const withinMessage of [false, true]) {
+				const h = harness();
+				const groups = [
+					[call("glob", "slot-g"), call("bash", "slot-b")],
+					[call("eval", "slot-e"), call("grep", "slot-s")],
+					[call("grep", "slot-s2"), call("glob", "slot-g2")],
+					[call("bash", "slot-b2"), call("eval", "slot-e2")],
+				];
+				const firstBlocks = [
+					groups[0][0],
+					{ type: "thinking" as const, thinking: "Keep the group" },
+					{ type: "text" as const, text: " \t\n" },
+					groups[0][1],
+				];
+				const prose = { type: "text" as const, text: "第一句" };
+				const read = call("read", "slot-read");
+				const tail = { type: "text" as const, text: "第二句" };
+				const messages = withinMessage
+					? [
+							assistantMessage(
+								...firstBlocks,
+								prose,
+								...groups[1],
+								read,
+								...groups[2],
+								tail,
+							),
+						]
+					: [
+							assistantMessage(...firstBlocks),
+							assistantMessage(prose),
+							assistantMessage(...groups[1]),
+							assistantMessage(read),
+							assistantMessage(...groups[2], tail),
+						];
+				if (!replay) await start(h);
+				const saved = [];
+				for (const message of messages) {
+					const detached = structuredClone(message);
+					if (!replay) {
+						await h.emit("turn_start");
+						await h.emit("message_update", {
+							message: structuredClone(message),
+						});
+						await h.emit("assistant_message", {
+							message: structuredClone(message),
+						});
+						for (const block of message.content)
+							if (block.type === "toolCall") await record(h, block);
+						// Persistence can lag the notification and native host mounting.
+						await h.emit("message_end", { message: detached });
+					}
+					saved.push(detached);
+				}
+				const user = {
+					role: "user" as const,
+					content: "Next prompt",
+					timestamp: 1,
+				};
+				if (!replay) {
+					await h.emit("before_agent_start");
+					await h.emit("message_end", { message: user });
+					for (const item of groups[3]) await record(h, item);
+					await h.emit("message_end", {
+						message: assistantMessage(...groups[3]),
+					});
+				}
+				if (replay) {
+					for (const message of saved) h.sessionManager.appendMessage(message);
+					h.sessionManager.appendMessage(user);
+					h.sessionManager.appendMessage({
+						...user,
+						content: "",
+						timestamp: 2,
+					});
+					h.sessionManager.appendMessage(assistantMessage(...groups[3]));
+					await start(h);
+				}
+				const savedCalls = saved.flatMap((message) =>
+					message.content.filter(
+						(block): block is Call =>
+							block.type === "toolCall" && block.name !== "read",
+					),
+				);
+				const replayGroups = [
+					savedCalls.slice(0, 2),
+					savedCalls.slice(2, 4),
+					savedCalls.slice(4),
+					groups[3],
+				];
+				const expected = [
+					" • Ran 1 bash command, globbed 1 pattern",
+					" • Evaluated 1 cell, grepped 1 pattern",
+					" • Grepped 1 pattern, globbed 1 pattern",
+					" • Ran 1 bash command, evaluated 1 cell",
+				];
+				for (const [index, calls] of replayGroups.entries()) {
+					const cards = calls.map((item) => {
+						const card = host(h, item);
+						card.setArgsComplete();
+						card.setExecutionStarted();
+						card.setTranscriptAllocation(1, { tick: 0, now: 0 });
+						return card;
+					});
+					const check = () => {
+						for (const width of [120, 18, 120])
+							expectCollapsedTurnGroup(cards, expected[index], width, 120);
+					};
+					check();
+					for (const isPartial of [true, true, false]) {
+						const results = calls.map((item) =>
+							item.name === "glob"
+								? globResults[0]
+								: item.name === "grep"
+									? grepResults[0]
+									: { ...nativeResult, isError: false },
+						);
+						for (const [i, card] of cards.entries())
+							card.updateResult(results[i], isPartial);
+						check();
+						for (let toggle = 0; toggle < 2; toggle++) {
+							for (const [i, card] of cards.entries())
+								expectExpandedHostResult(
+									h,
+									calls[i],
+									card,
+									results[i],
+									120,
+									isPartial,
+								);
+							check();
+						}
+					}
+				}
+			}
+		} finally {
+			chalk.level = level;
+		}
+	},
+);
+
+test("direct untracked callbacks and late assistant snapshots apply one boundary, while growing blank text becomes a boundary", async () => {
+	const h = await start();
+	const first = call("bash", "direct-first");
+	const read = call("read", "direct-read");
+	const second = call("glob", "direct-second");
+	for (const item of [first, read, second]) await record(h, item);
+	const owner = summary(h, second);
+	const message = assistantMessage(first, read, second);
+	await h.emit("message_end", { message });
+	const third = call("grep", "direct-third");
+	await record(h, third);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Grepped 1 pattern, globbed 1 pattern",
+	]);
+	expect(summary(h, third)).toBeUndefined();
+	await h.emit("message_update", {
+		message: assistantMessage({ type: "text", text: "" }),
+	});
+	await h.emit("message_update", {
+		message: assistantMessage({ type: "text", text: "  " }),
+	});
+	const fourth = call("eval", "after-growing-prose");
+	const growing = assistantMessage({ type: "text", text: "Now prose" }, fourth);
+	await h.emit("message_update", { message: structuredClone(growing) });
+	await h.emit("assistant_message", { message: structuredClone(growing) });
+	await record(h, fourth);
+	await h.emit("message_end", { message: growing });
+	expect(summary(h, fourth)?.render(120).map(stripVTControlCharacters)).toEqual(
+		[" • Evaluated 1 cell"],
+	);
+	expect(summary(h, first)?.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command",
+	]);
+});
+
+test("finalized prose replacing a streamed blank prefix closes the run before pending callbacks", async () => {
+	const h = await start();
+	const previous = call("bash", "prefix-previous");
+	const next = call("glob", "prefix-next");
+	await record(h, previous);
+	await h.emit("message_update", {
+		message: assistantMessage(
+			{ type: "text", text: "  " },
+			structuredClone(next),
+		),
+	});
+	const message = assistantMessage(
+		{ type: "text", text: "Finalized leading prose" },
+		next,
+	);
+	await h.emit("assistant_message", { message: structuredClone(message) });
+	await record(h, next);
+	await h.emit("message_end", { message });
+	expect(summary(h, next)?.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Globbed 1 pattern",
+	]);
+	expect(
+		summary(h, previous)?.render(120).map(stripVTControlCharacters),
+	).toEqual([" • Ran 1 bash command"]);
+});
+
+test("reused tool-call IDs across resumed and live prompts retain argument identity and independent summaries", async () => {
+	const h = harness();
+	h.sessionManager.appendMessage({
+		role: "user",
+		content: "Saved prompt",
+		timestamp: 1,
+	});
+	const historical = [
+		call("glob", "reused"),
+		call("bash", "saved-b"),
+		call("eval", "saved-e"),
+		call("grep", "saved-s"),
+	];
+	h.sessionManager.appendMessage(assistantMessage(...historical));
+	await start(h);
+	const savedOwner = summary(h, historical[0]);
+	for (let prompt = 2; prompt < 4; prompt++) {
+		if (prompt === 2) await h.emit("before_agent_start");
+		const user = {
+			role: "user" as const,
+			content: `Prompt ${prompt}`,
+			timestamp: prompt,
+		};
+		h.sessionManager.appendMessage(user);
+		await h.emit("message_end", { message: structuredClone(user) });
+		const next = call("glob", "reused");
+		const message = assistantMessage(next);
+		await h.emit("assistant_message", { message: structuredClone(message) });
+		await record(h, next);
+		h.sessionManager.appendMessage(message);
+		await h.emit("message_end", { message: structuredClone(message) });
+		expect(summary(h, next)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Globbed 1 pattern"],
+		);
+		expect(savedOwner.render(120).map(stripVTControlCharacters)).toEqual([
+			" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 1 pattern",
+		]);
+	}
+});
