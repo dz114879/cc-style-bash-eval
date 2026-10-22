@@ -64,11 +64,10 @@ function isBoundary(block: AssistantBlock): boolean {
 class Observation {
 	private content: AssistantBlock[] = [];
 	private cursor = 0;
-	private readonly boundaries = new Set<number>();
+	private readonly boundaries = new Map<number, (() => void) | undefined>();
 	private readonly consumed = new Map<number, string>();
 	private finalized = false;
 	private ended = false;
-	private uncommitted?: { indices: Set<number>; restore: () => void };
 
 	constructor(
 		readonly prompt: number,
@@ -131,22 +130,17 @@ class Observation {
 		if (index < 0) return undefined;
 		this.advance(index + 1);
 		this.consumed.set(index, id);
-		if (isTrackedToolName(name)) this.uncommitted = undefined;
 		const block = this.content[index];
 		return block.type === "toolCall" ? block.arguments : undefined;
 	}
 
 	private retractBlankBoundaries(): void {
-		if (!this.uncommitted) return;
-		for (const index of this.uncommitted.indices) {
+		for (const [index, restore] of this.boundaries) {
+			if (!restore) continue;
 			const block = this.content[index];
 			if (block && isBoundary(block)) continue;
+			restore();
 			this.boundaries.delete(index);
-			this.uncommitted.indices.delete(index);
-		}
-		if (this.uncommitted.indices.size === 0) {
-			this.uncommitted.restore();
-			this.uncommitted = undefined;
 		}
 	}
 
@@ -155,14 +149,11 @@ class Observation {
 			const index = this.cursor;
 			const block = this.content[index];
 			if (isBoundary(block) && !this.boundaries.has(index)) {
-				if (block.type !== "toolCall" || !this.consumed.has(index)) {
-					this.uncommitted ??= {
-						indices: new Set(),
-						restore: this.closeGroup(),
-					};
-					this.uncommitted.indices.add(index);
-				}
-				this.boundaries.add(index);
+				const restore =
+					block.type !== "toolCall" || !this.consumed.has(index)
+						? this.closeGroup()
+						: undefined;
+				this.boundaries.set(index, block.type === "text" ? restore : undefined);
 			}
 			this.cursor++;
 		}
@@ -197,6 +188,8 @@ export class TurnGroups {
 	private readonly calls = new WeakMap<object, Membership>();
 	private readonly liveById = new Map<string, Membership>();
 	private readonly persistedTotals = new WeakMap<TurnGroup, TurnGroup>();
+	private readonly members = new WeakMap<TurnGroup, Membership[]>();
+	private readonly mergedInto = new WeakMap<TurnGroup, TurnGroup>();
 	private branch = new WeakMap<object, TurnGroupSummary>();
 	private pending?: Observation;
 	private readonly observations = new WeakMap<object, Observation>();
@@ -214,10 +207,38 @@ export class TurnGroups {
 		const previous = this.current;
 		const next = emptyTurnGroup();
 		this.current = next;
-		return () => {
-			// Never undo a split after an invocation or a later message/prompt boundary.
-			if (this.current === next && total(next) === 0) this.current = previous;
-		};
+		return () => this.mergeGroups(previous, next);
+	}
+
+	private resolveGroup(group: TurnGroup): TurnGroup {
+		let merged = this.mergedInto.get(group);
+		while (merged) {
+			group = merged;
+			merged = this.mergedInto.get(group);
+		}
+		return group;
+	}
+
+	private mergeGroups(previous: TurnGroup, next: TurnGroup): void {
+		// Earlier rewrites may already have merged either side of this boundary.
+		previous = this.resolveGroup(previous);
+		next = this.resolveGroup(next);
+		if (previous === next) return;
+		const offset = total(previous);
+		const members = this.members.get(previous) ?? [];
+		for (const member of this.members.get(next) ?? []) {
+			member.group = previous;
+			member.index += offset;
+			members.push(member);
+		}
+		this.members.set(previous, members);
+		this.members.delete(next);
+		previous.bash += next.bash;
+		previous.eval += next.eval;
+		previous.grep += next.grep;
+		previous.glob += next.glob;
+		this.mergedInto.set(next, previous);
+		if (this.current === next) this.current = previous;
 	}
 
 	rebuild(entries: readonly SessionEntry[]): void {
@@ -339,6 +360,9 @@ export class TurnGroups {
 			const index = total(this.current);
 			this.current[toolName]++;
 			const membership = { group: this.current, index };
+			const members = this.members.get(this.current) ?? [];
+			members.push(membership);
+			this.members.set(this.current, members);
 			this.calls.set(input, membership);
 			this.liveById.set(key, membership);
 			if (snapshotInput) this.calls.set(snapshotInput, membership);

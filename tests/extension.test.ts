@@ -2645,12 +2645,7 @@ test.each([
 		const second = call("eval", "rollback-second");
 		const next = call("grep", "rollback-next");
 		const tracked = [previous, first, second, next];
-		const cards = tracked.map((item) => {
-			const card = host(h, item);
-			card.setArgsComplete();
-			card.setExecutionStarted();
-			return card;
-		});
+		const cards = tracked.map((item) => host(h, item));
 		const prose = { type: "text" as const, text: "Temporary streamed prose" };
 		const message = assistantMessage(
 			...(position === "leading"
@@ -2662,20 +2657,44 @@ test.each([
 						: [prose]),
 		);
 		await h.emit("message_update", { message: structuredClone(message) });
-		if (phase === "message_end")
+		let splitOwner: ReturnType<typeof summary> | undefined;
+		if (phase === "message_end") {
 			await h.emit("assistant_message", { message: structuredClone(message) });
-		if (position === "interleaved" || position === "trailing")
-			await record(h, first);
-		if (position === "trailing") await record(h, second);
+			if (position !== "standalone") {
+				await record(h, first);
+				await record(h, second);
+				for (const card of cards.slice(1, 3)) {
+					card.setArgsComplete();
+					card.setExecutionStarted();
+				}
+			}
+			if (position === "leading" || position === "interleaved") {
+				const index = position === "leading" ? 1 : 2;
+				splitOwner = summary(h, tracked[index]);
+				expect(splitOwner?.render(120)).toHaveLength(1);
+				expect(trimBlankEdges(cards[index].render(120))).toHaveLength(1);
+			}
+		} else {
+			if (position === "interleaved" || position === "trailing")
+				await record(h, first);
+			if (position === "trailing") await record(h, second);
+		}
 		prose.text = blank;
-		await h.emit(phase, { message: structuredClone(message) });
-		if (phase === "message_update")
-			await h.emit("assistant_message", { message: structuredClone(message) });
-		if (position === "leading") await record(h, first);
-		if (position === "leading" || position === "interleaved")
-			await record(h, second);
+		if (phase !== "message_end") {
+			await h.emit(phase, { message: structuredClone(message) });
+			if (phase === "message_update")
+				await h.emit("assistant_message", {
+					message: structuredClone(message),
+				});
+			if (position === "leading") await record(h, first);
+			if (position === "leading" || position === "interleaved")
+				await record(h, second);
+		}
 		h.sessionManager.appendMessage(structuredClone(message));
 		await h.emit("message_end", { message: structuredClone(message) });
+		if (splitOwner) expect(splitOwner.render(120)).toEqual([]);
+		for (const card of cards.slice(1, 3))
+			expect(trimBlankEdges(card.render(120))).toHaveLength(0);
 		if (position === "standalone") {
 			const tools = assistantMessage(first, second);
 			await h.emit("assistant_message", { message: structuredClone(tools) });
@@ -2729,3 +2748,98 @@ test.each([
 				expectCollapsedTurnGroup(group, expected, width, 120);
 	},
 );
+
+test("message_end retracts multiple recorded prose splits while preserving untracked and remaining prose boundaries", async () => {
+	const h = await start();
+	const previous = call("glob", "chain-previous");
+	await record(h, previous);
+	const previousMessage = assistantMessage(previous);
+	h.sessionManager.appendMessage(previousMessage);
+	await h.emit("message_end", { message: structuredClone(previousMessage) });
+	const first = call("bash", "chain-first");
+	const second = call("eval", "chain-second");
+	const read = call("read", "chain-read");
+	const third = call("grep", "chain-third");
+	const leading = { type: "text" as const, text: "Temporary prefix" };
+	const middle = { type: "text" as const, text: "Temporary interleaving" };
+	const message = assistantMessage(
+		leading,
+		first,
+		middle,
+		second,
+		read,
+		third,
+		{ type: "text", text: "Keep the trailing boundary" },
+	);
+	await h.emit("message_update", { message: structuredClone(message) });
+	const snapshot = structuredClone(message);
+	await h.emit("assistant_message", { message: snapshot });
+	for (const item of [first, second, read, third]) await record(h, item);
+	const detachedCalls = snapshot.content.filter(
+		(block): block is Call =>
+			block.type === "toolCall" && block.name !== "read",
+	);
+	const held = detachedCalls.map((item) => summary(h, item));
+	const cards = [previous, ...detachedCalls].map((item) => {
+		const card = host(h, item);
+		card.setArgsComplete();
+		card.setExecutionStarted();
+		return card;
+	});
+	for (const card of cards)
+		expect(trimBlankEdges(card.render(120))).toHaveLength(1);
+	leading.text = "";
+	middle.text = "   ";
+	h.sessionManager.appendMessage(structuredClone(message));
+	await h.emit("message_end", { message: structuredClone(message) });
+	expect(held[0].render(120)).toEqual([]);
+	expect(held[1].render(120)).toEqual([]);
+	const merged = " • Ran 1 bash command, evaluated 1 cell, globbed 1 pattern";
+	for (const width of [120, 18, 120]) {
+		expectCollapsedTurnGroup(cards.slice(0, 3), merged, width, 120);
+		expectCollapsedTurnGroup(
+			cards.slice(3),
+			" • Grepped 1 pattern",
+			width,
+			120,
+		);
+	}
+	const next = call("glob", "chain-next");
+	await record(h, next);
+	h.sessionManager.appendMessage(assistantMessage(next));
+	await h.emit("message_end", {
+		message: assistantMessage(structuredClone(next)),
+	});
+	const expected = [
+		[merged],
+		undefined,
+		undefined,
+		[" • Grepped 1 pattern"],
+		[" • Globbed 1 pattern"],
+	];
+	expect(
+		[previous, first, second, third, next].map<string[] | undefined>((item) =>
+			summary(h, item)?.render(120).map(stripVTControlCharacters),
+		),
+	).toEqual(expected);
+	const replay = harness();
+	const savedCalls: Call[] = [];
+	for (const entry of h.sessionManager.getBranch()) {
+		if (entry.type !== "message" || entry.message.role !== "assistant")
+			continue;
+		const saved = structuredClone(entry.message);
+		replay.sessionManager.appendMessage(saved);
+		savedCalls.push(
+			...saved.content.filter(
+				(block): block is Call =>
+					block.type === "toolCall" && block.name !== "read",
+			),
+		);
+	}
+	await start(replay);
+	expect(
+		savedCalls.map<string[] | undefined>((item) =>
+			summary(replay, item)?.render(120).map(stripVTControlCharacters),
+		),
+	).toEqual(expected);
+});
