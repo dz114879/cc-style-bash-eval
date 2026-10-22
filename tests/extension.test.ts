@@ -2411,3 +2411,321 @@ test("reused tool-call IDs across resumed and live prompts retain argument ident
 		]);
 	}
 });
+
+test("host-repaired IDs reused across internal turns preserve live boundaries and detached replay", async () => {
+	const h = await start();
+	const earlier = call("bash", "call_1");
+	const firstMessage = assistantMessage(earlier);
+	await h.emit("assistant_message", { message: structuredClone(firstMessage) });
+	await record(h, earlier);
+	h.sessionManager.appendMessage(firstMessage);
+	await h.emit("message_end", { message: structuredClone(firstMessage) });
+	const earlierOwner = summary(h, earlier);
+	await h.emit("turn_start");
+	const raw = call("bash", "call_1");
+	const repaired = { ...structuredClone(raw), id: "call_1_dup1" };
+	const follower = call("eval", "second-eval");
+	const middle = call("glob", "second-glob");
+	const read = call("read", "second-read");
+	const last = call("grep", "second-grep");
+	const message = assistantMessage(
+		{ type: "text", text: "Leading prose" },
+		raw,
+		follower,
+		{ type: "text", text: "Interleaved prose" },
+		middle,
+		read,
+		last,
+		{ type: "text", text: "Trailing prose" },
+	);
+	await h.emit("message_update", { message: structuredClone(message) });
+	await h.emit("assistant_message", { message: structuredClone(message) });
+	for (const item of [repaired, follower, middle, read, last])
+		await record(h, item);
+	const next = call("eval", "after-repair");
+	await record(h, next);
+	const expected = [
+		[" • Ran 1 bash command"],
+		[" • Ran 1 bash command, evaluated 1 cell"],
+		undefined,
+		[" • Globbed 1 pattern"],
+		[" • Grepped 1 pattern"],
+		[" • Evaluated 1 cell"],
+	];
+	const tracked = [earlier, repaired, follower, middle, last, next];
+	expect(
+		tracked.map<string[] | undefined>((item) =>
+			summary(h, item)?.render(120).map(stripVTControlCharacters),
+		),
+	).toEqual(expected);
+	const persisted = structuredClone(message);
+	persisted.content[1] = structuredClone(repaired);
+	h.sessionManager.appendMessage(persisted);
+	await h.emit("message_end", { message: structuredClone(persisted) });
+	h.sessionManager.appendMessage(assistantMessage(next));
+	await h.emit("message_end", {
+		message: assistantMessage(structuredClone(next)),
+	});
+	expect(earlierOwner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command",
+	]);
+	const replay = harness();
+	const savedCalls: Call[] = [];
+	for (const entry of h.sessionManager.getBranch()) {
+		if (entry.type !== "message" || entry.message.role !== "assistant")
+			continue;
+		const saved = structuredClone(entry.message);
+		replay.sessionManager.appendMessage(saved);
+		savedCalls.push(
+			...saved.content.filter(
+				(block): block is Call =>
+					block.type === "toolCall" && block.name !== "read",
+			),
+		);
+	}
+	await start(replay);
+	expect(
+		savedCalls.map<string[] | undefined>((item) =>
+			summary(replay, item)?.render(120).map(stripVTControlCharacters),
+		),
+	).toEqual(expected);
+});
+
+test.each(["call_1", ""])(
+	"duplicate raw IDs '%s' repaired before dispatch retain chronological host slots",
+	async (rawId) => {
+		const h = await start();
+		const earlier = call("glob", "before-duplicates");
+		await record(h, earlier);
+		const rawCalls = Array.from({ length: 4 }, () => call("bash", rawId));
+		const repaired = rawCalls.map((item, index) => ({
+			...structuredClone(item),
+			id: rawId
+				? index === 0
+					? rawId
+					: `${rawId}_dup${index}`
+				: `minted-${index}`,
+		}));
+		const rawRead = call("read", rawId);
+		const repairedRead = { ...structuredClone(rawRead), id: "repaired-read" };
+		const message = assistantMessage(
+			{ type: "text", text: "Leading prose" },
+			rawCalls[0],
+			rawCalls[1],
+			{ type: "text", text: "Interleaved prose" },
+			rawCalls[2],
+			rawRead,
+			rawCalls[3],
+			{ type: "text", text: "Trailing prose" },
+		);
+		await h.emit("message_update", { message: structuredClone(message) });
+		await h.emit("assistant_message", { message: structuredClone(message) });
+		for (const item of [...repaired.slice(0, 3), repairedRead, repaired[3]])
+			await record(h, item);
+		const expected = [
+			[" • Ran 2 bash commands"],
+			undefined,
+			[" • Ran 1 bash command"],
+			[" • Ran 1 bash command"],
+		];
+		expect(
+			repaired.map<string[] | undefined>((item) =>
+				summary(h, item)?.render(120).map(stripVTControlCharacters),
+			),
+		).toEqual(expected);
+		const detached = structuredClone(message);
+		// A detached snapshot can still carry the pre-repair IDs; persistence has the repaired IDs.
+		await h.emit("message_end", { message: detached });
+		const detachedCalls = detached.content.filter(
+			(block): block is Call =>
+				block.type === "toolCall" && block.name === "bash",
+		);
+		expect(
+			detachedCalls.map<string[] | undefined>((item) =>
+				summary(h, item)?.render(120).map(stripVTControlCharacters),
+			),
+		).toEqual(expected);
+		const next = call("eval", "after-duplicates");
+		await record(h, next);
+		expect(summary(h, next)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Evaluated 1 cell"],
+		);
+		expect(
+			summary(h, earlier)?.render(120).map(stripVTControlCharacters),
+		).toEqual([" • Globbed 1 pattern"]);
+		const persisted = structuredClone(message);
+		const dispatched = [...repaired.slice(0, 3), repairedRead, repaired[3]];
+		let slot = 0;
+		persisted.content = persisted.content.map((block) =>
+			block.type === "toolCall" ? structuredClone(dispatched[slot++]) : block,
+		);
+		const replay = harness();
+		replay.sessionManager.appendMessage(persisted);
+		await start(replay);
+		const savedCalls = persisted.content.filter(
+			(block): block is Call =>
+				block.type === "toolCall" && block.name === "bash",
+		);
+		h.sessionManager.appendMessage(persisted);
+		await h.emit("message_end", { message: persisted });
+		expect(
+			savedCalls.map<string[] | undefined>((item) =>
+				summary(h, item)?.render(120).map(stripVTControlCharacters),
+			),
+		).toEqual(expected);
+		for (const [context, calls] of [
+			[h, detachedCalls],
+			[replay, savedCalls],
+		] as const) {
+			const cards = calls.map((item) => {
+				const card = host(context, item);
+				card.setArgsComplete();
+				card.setExecutionStarted();
+				card.updateResult({ ...nativeResult, isError: false }, false);
+				return card;
+			});
+			for (let toggle = 0; toggle < 2; toggle++) {
+				for (const width of [120, 18, 120]) {
+					expectCollapsedTurnGroup(
+						cards.slice(0, 2),
+						" • Ran 2 bash commands",
+						width,
+						120,
+					);
+					expectCollapsedTurnGroup(
+						cards.slice(2, 3),
+						" • Ran 1 bash command",
+						width,
+						120,
+					);
+					expectCollapsedTurnGroup(
+						cards.slice(3),
+						" • Ran 1 bash command",
+						width,
+						120,
+					);
+				}
+				for (const [index, card] of cards.entries())
+					expectExpandedHostResult(
+						context,
+						calls[index],
+						card,
+						{ ...nativeResult, isError: false },
+						120,
+					);
+			}
+		}
+	},
+);
+
+test.each([
+	["leading", "message_update", ""],
+	["leading", "assistant_message", "   "],
+	["leading", "message_end", ""],
+	["interleaved", "message_update", "   "],
+	["interleaved", "assistant_message", ""],
+	["interleaved", "message_end", "   "],
+	["trailing", "message_update", ""],
+	["trailing", "assistant_message", "   "],
+	["trailing", "message_end", ""],
+	["standalone", "message_update", "   "],
+	["standalone", "assistant_message", ""],
+	["standalone", "message_end", "   "],
+])(
+	"%s streamed prose rewritten to blank on %s preserves the held owner and replay",
+	async (position, phase, blank) => {
+		const h = await start();
+		const previous = call("glob", "rollback-previous");
+		await record(h, previous);
+		const firstMessage = assistantMessage(previous);
+		h.sessionManager.appendMessage(firstMessage);
+		await h.emit("message_end", { message: structuredClone(firstMessage) });
+		const owner = summary(h, previous);
+		const first = call("bash", "rollback-first");
+		const second = call("eval", "rollback-second");
+		const next = call("grep", "rollback-next");
+		const tracked = [previous, first, second, next];
+		const cards = tracked.map((item) => {
+			const card = host(h, item);
+			card.setArgsComplete();
+			card.setExecutionStarted();
+			return card;
+		});
+		const prose = { type: "text" as const, text: "Temporary streamed prose" };
+		const message = assistantMessage(
+			...(position === "leading"
+				? [prose, first, second]
+				: position === "interleaved"
+					? [first, prose, second]
+					: position === "trailing"
+						? [first, second, prose]
+						: [prose]),
+		);
+		await h.emit("message_update", { message: structuredClone(message) });
+		if (phase === "message_end")
+			await h.emit("assistant_message", { message: structuredClone(message) });
+		if (position === "interleaved" || position === "trailing")
+			await record(h, first);
+		if (position === "trailing") await record(h, second);
+		prose.text = blank;
+		await h.emit(phase, { message: structuredClone(message) });
+		if (phase === "message_update")
+			await h.emit("assistant_message", { message: structuredClone(message) });
+		if (position === "leading") await record(h, first);
+		if (position === "leading" || position === "interleaved")
+			await record(h, second);
+		h.sessionManager.appendMessage(structuredClone(message));
+		await h.emit("message_end", { message: structuredClone(message) });
+		if (position === "standalone") {
+			const tools = assistantMessage(first, second);
+			await h.emit("assistant_message", { message: structuredClone(tools) });
+			await record(h, first);
+			await record(h, second);
+			h.sessionManager.appendMessage(tools);
+			await h.emit("message_end", { message: structuredClone(tools) });
+		}
+		await h.emit("turn_start");
+		await h.emit("assistant_message", {
+			message: assistantMessage(structuredClone(next)),
+		});
+		await record(h, next);
+		const expected =
+			" • Ran 1 bash command, evaluated 1 cell, grepped 1 pattern, globbed 1 pattern";
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+		for (const item of tracked.slice(1))
+			expect(summary(h, item)).toBeUndefined();
+		h.sessionManager.appendMessage(assistantMessage(next));
+		await h.emit("message_end", {
+			message: assistantMessage(structuredClone(next)),
+		});
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+		const replay = harness();
+		const savedCalls: Call[] = [];
+		for (const entry of h.sessionManager.getBranch()) {
+			if (entry.type !== "message" || entry.message.role !== "assistant")
+				continue;
+			const saved = structuredClone(entry.message);
+			replay.sessionManager.appendMessage(saved);
+			savedCalls.push(
+				...saved.content.filter(
+					(block): block is Call => block.type === "toolCall",
+				),
+			);
+		}
+		await start(replay);
+		expect(
+			savedCalls.map<string[] | undefined>((item) =>
+				summary(replay, item)?.render(120).map(stripVTControlCharacters),
+			),
+		).toEqual([[expected], undefined, undefined, undefined]);
+		const replayCards = savedCalls.map((item) => {
+			const card = host(replay, item);
+			card.setArgsComplete();
+			card.setExecutionStarted();
+			return card;
+		});
+		for (const group of [cards, replayCards])
+			for (const width of [120, 18, 120])
+				expectCollapsedTurnGroup(group, expected, width, 120);
+	},
+);

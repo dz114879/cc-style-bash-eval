@@ -61,13 +61,135 @@ function isBoundary(block: AssistantBlock): boolean {
 	);
 }
 
-interface Observation {
-	prompt: number;
-	content: AssistantBlock[];
-	cursor: number;
-	boundaries: Set<number>;
-	finalized: boolean;
-	ended: boolean;
+class Observation {
+	private content: AssistantBlock[] = [];
+	private cursor = 0;
+	private readonly boundaries = new Set<number>();
+	private readonly consumed = new Map<number, string>();
+	private finalized = false;
+	private ended = false;
+	private uncommitted?: { indices: Set<number>; restore: () => void };
+
+	constructor(
+		readonly prompt: number,
+		private readonly closeGroup: () => () => void,
+		private readonly wasRecorded: (id: string, name: string) => boolean,
+	) {}
+
+	get isEnded(): boolean {
+		return this.ended;
+	}
+
+	get isFinalized(): boolean {
+		return this.finalized;
+	}
+
+	*calls(content = this.content) {
+		for (const [index, block] of content.entries()) {
+			if (block.type !== "toolCall") continue;
+			yield {
+				...block,
+				id: this.consumed.get(index) ?? block.id,
+				recorded: this.consumed.has(index),
+			};
+		}
+	}
+
+	update(content: AssistantBlock[], phase: ObservationPhase): void {
+		this.content = content;
+		this.finalized = phase !== "update";
+		this.ended = phase === "end";
+		this.retractBlankBoundaries();
+		if (this.ended) {
+			for (const [index, block] of content.entries()) {
+				if (
+					block.type === "toolCall" &&
+					!this.consumed.has(index) &&
+					this.wasRecorded(block.id, block.name)
+				)
+					this.consumed.set(index, block.id);
+			}
+		}
+		// Finalization can replace a blank block before the pending tool slot.
+		const cursor = Math.min(this.cursor, content.length);
+		this.cursor = 0;
+		this.advance(cursor);
+		this.drain();
+	}
+
+	record(name: string, id: string): object | undefined {
+		const matches = (block: AssistantBlock, index: number) =>
+			index >= this.cursor &&
+			!this.consumed.has(index) &&
+			block.type === "toolCall" &&
+			block.name === name;
+		let index = this.content.findIndex(
+			(block, index) =>
+				matches(block, index) && block.type === "toolCall" && block.id === id,
+		);
+		if (index < 0) index = this.content.findIndex(matches);
+		if (index < 0) return undefined;
+		this.advance(index + 1);
+		this.consumed.set(index, id);
+		if (isTrackedToolName(name)) this.uncommitted = undefined;
+		const block = this.content[index];
+		return block.type === "toolCall" ? block.arguments : undefined;
+	}
+
+	private retractBlankBoundaries(): void {
+		if (!this.uncommitted) return;
+		for (const index of this.uncommitted.indices) {
+			const block = this.content[index];
+			if (block && isBoundary(block)) continue;
+			this.boundaries.delete(index);
+			this.uncommitted.indices.delete(index);
+		}
+		if (this.uncommitted.indices.size === 0) {
+			this.uncommitted.restore();
+			this.uncommitted = undefined;
+		}
+	}
+
+	private advance(end: number): void {
+		while (this.cursor < end) {
+			const index = this.cursor;
+			const block = this.content[index];
+			if (isBoundary(block) && !this.boundaries.has(index)) {
+				if (block.type !== "toolCall" || !this.consumed.has(index)) {
+					this.uncommitted ??= {
+						indices: new Set(),
+						restore: this.closeGroup(),
+					};
+					this.uncommitted.indices.add(index);
+				}
+				this.boundaries.add(index);
+			}
+			this.cursor++;
+		}
+	}
+
+	drain(): void {
+		while (this.cursor < this.content.length) {
+			const block = this.content[this.cursor];
+			if (
+				block.type === "toolCall" &&
+				!this.ended &&
+				!this.consumed.has(this.cursor)
+			)
+				return;
+			const index = this.cursor;
+			this.advance(index + 1);
+			// The last streaming text block can still grow from blank to prose.
+			if (
+				!this.finalized &&
+				index === this.content.length - 1 &&
+				block.type !== "toolCall"
+			) {
+				this.cursor = index;
+				return;
+			}
+		}
+	}
 }
 
 export class TurnGroups {
@@ -88,47 +210,14 @@ export class TurnGroups {
 		this.rebuild(entries);
 	}
 
-	private closeGroup(): void {
-		this.current = emptyTurnGroup();
-	}
-
-	private advance(observation: Observation, end: number): void {
-		while (observation.cursor < end) {
-			const index = observation.cursor;
-			const block = observation.content[index];
-			if (isBoundary(block) && !observation.boundaries.has(index)) {
-				if (
-					block.type !== "toolCall" ||
-					!this.recorded.has(callKey(observation.prompt, block.id, block.name))
-				)
-					this.closeGroup();
-				observation.boundaries.add(index);
-			}
-			observation.cursor++;
-		}
-	}
-
-	private drain(observation: Observation): void {
-		while (observation.cursor < observation.content.length) {
-			const block = observation.content[observation.cursor];
-			if (
-				block.type === "toolCall" &&
-				!observation.ended &&
-				!this.recorded.has(callKey(observation.prompt, block.id, block.name))
-			)
-				return;
-			const index = observation.cursor;
-			this.advance(observation, index + 1);
-			// The last streaming text block can still grow from blank to prose.
-			if (
-				!observation.finalized &&
-				index === observation.content.length - 1 &&
-				block.type !== "toolCall"
-			) {
-				observation.cursor = index;
-				return;
-			}
-		}
+	private closeGroup(): () => void {
+		const previous = this.current;
+		const next = emptyTurnGroup();
+		this.current = next;
+		return () => {
+			// Never undo a split after an invocation or a later message/prompt boundary.
+			if (this.current === next && total(next) === 0) this.current = previous;
+		};
 	}
 
 	rebuild(entries: readonly SessionEntry[]): void {
@@ -203,61 +292,48 @@ export class TurnGroups {
 		}
 		if (message.role !== "assistant") return;
 		let observation = this.observations.get(message);
+		const pending = this.pending?.isEnded ? undefined : this.pending;
 		for (const block of message.content) {
-			if (block.type !== "toolCall") continue;
-			const key = callKey(
-				observation?.prompt ?? this.prompt,
-				block.id,
-				block.name,
+			if (observation || block.type !== "toolCall") continue;
+			const candidate = this.messagesByCall.get(
+				callKey(this.prompt, block.id, block.name),
 			);
-			observation ??= this.messagesByCall.get(key);
-			const live = this.liveById.get(key);
-			if (live) this.calls.set(block.arguments, live);
+			if (candidate && (!candidate.isEnded || (phase === "end" && !pending)))
+				observation = candidate;
 		}
 		observation ??=
-			this.pending && !this.pending.finalized
-				? this.pending
-				: {
-						prompt: this.prompt,
-						content: [],
-						cursor: 0,
-						boundaries: new Set(),
-						finalized: false,
-						ended: false,
-					};
+			pending && (!pending.isFinalized || phase === "end")
+				? pending
+				: new Observation(
+						this.prompt,
+						() => this.closeGroup(),
+						(id, name) => this.recorded.has(callKey(this.prompt, id, name)),
+					);
 		this.observations.set(message, observation);
-		if (observation.ended) return;
-		observation.content = message.content;
-		// Finalized text can replace a blank block before the pending tool slot.
-		const cursor = observation.cursor;
-		observation.cursor = 0;
-		this.advance(observation, cursor);
-		observation.finalized = phase !== "update";
-		observation.ended = phase === "end";
-		this.pending = observation;
-		for (const block of message.content) {
-			if (block.type === "toolCall")
-				this.messagesByCall.set(
-					callKey(observation.prompt, block.id, block.name),
-					observation,
-				);
+		if (!observation.isEnded) {
+			observation.update(message.content, phase);
+			this.pending = observation;
 		}
-		this.drain(observation);
+		for (const block of observation.calls(message.content)) {
+			const key = callKey(observation.prompt, block.id, block.name);
+			this.messagesByCall.set(key, observation);
+			const live = block.recorded ? this.liveById.get(key) : undefined;
+			if (live) this.calls.set(block.arguments, live);
+		}
 	}
 
 	record(toolName: string, input: object, toolCallId: string): void {
 		const key = callKey(this.prompt, toolCallId, toolName);
 		if (this.recorded.has(key)) return;
-		const observation = this.messagesByCall.get(key);
-		if (observation) {
-			const index = observation.content.findIndex(
-				(block) =>
-					block.type === "toolCall" &&
-					block.id === toolCallId &&
-					block.name === toolName,
-			);
-			this.advance(observation, index + 1);
-		}
+		let observation = this.messagesByCall.get(key);
+		if (
+			(!observation || observation.isEnded) &&
+			this.pending &&
+			!this.pending.isEnded
+		)
+			observation = this.pending;
+		const snapshotInput = observation?.record(toolName, toolCallId);
+		if (snapshotInput && observation) this.messagesByCall.set(key, observation);
 		this.recorded.add(key);
 		if (isTrackedToolName(toolName)) {
 			const index = total(this.current);
@@ -265,8 +341,9 @@ export class TurnGroups {
 			const membership = { group: this.current, index };
 			this.calls.set(input, membership);
 			this.liveById.set(key, membership);
+			if (snapshotInput) this.calls.set(snapshotInput, membership);
 		} else if (!observation) this.closeGroup();
-		if (observation) this.drain(observation);
+		observation?.drain();
 	}
 
 	private lookup(input: object): Membership | undefined {
