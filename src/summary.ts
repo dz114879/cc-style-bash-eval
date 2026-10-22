@@ -219,12 +219,19 @@ export class TurnGroups {
 		return group;
 	}
 
+	private reconciledTotals(group: TurnGroup): TurnGroup {
+		const persisted = this.persistedTotals.get(group);
+		return persisted && total(persisted) >= total(group) ? persisted : group;
+	}
+
 	private mergeGroups(previous: TurnGroup, next: TurnGroup): void {
 		// Earlier rewrites may already have merged either side of this boundary.
 		previous = this.resolveGroup(previous);
 		next = this.resolveGroup(next);
 		if (previous === next) return;
-		const offset = total(previous);
+		const previousTotals = this.reconciledTotals(previous);
+		const nextTotals = this.reconciledTotals(next);
+		const offset = total(previousTotals);
 		const members = this.members.get(previous) ?? [];
 		for (const member of this.members.get(next) ?? []) {
 			member.group = previous;
@@ -233,10 +240,12 @@ export class TurnGroups {
 		}
 		this.members.set(previous, members);
 		this.members.delete(next);
-		previous.bash += next.bash;
-		previous.eval += next.eval;
-		previous.grep += next.grep;
-		previous.glob += next.glob;
+		previous.bash = previousTotals.bash + nextTotals.bash;
+		previous.eval = previousTotals.eval + nextTotals.eval;
+		previous.grep = previousTotals.grep + nextTotals.grep;
+		previous.glob = previousTotals.glob + nextTotals.glob;
+		this.persistedTotals.delete(previous);
+		this.persistedTotals.delete(next);
 		this.mergedInto.set(next, previous);
 		if (this.current === next) this.current = previous;
 	}
@@ -375,10 +384,7 @@ export class TurnGroups {
 		if (live) {
 			// Open groups use invocation counts, even when persistence is ahead.
 			if (live.group === this.current) return live;
-			const persisted = this.persistedTotals.get(live.group);
-			return persisted && total(persisted) >= total(live.group)
-				? { group: persisted, index: live.index }
-				: live;
+			return { group: this.reconciledTotals(live.group), index: live.index };
 		}
 		const branch = this.branch.get(input);
 		return branch ? { group: branch, index: branch.index } : undefined;

@@ -2843,3 +2843,58 @@ test("message_end retracts multiple recorded prose splits while preserving untra
 		),
 	).toEqual(expected);
 });
+
+test("late prose merges retain fuller persisted totals while the branch lags and catches up", async () => {
+	const h = await start();
+	const first = call("glob", "reconciled-first");
+	const persistedOnly = call("glob", "reconciled-persisted-only");
+	await record(h, first);
+	const earlier = assistantMessage(first, persistedOnly);
+	h.sessionManager.appendMessage(earlier);
+	await h.emit("message_end", { message: structuredClone(earlier) });
+	const owner = summary(h, first);
+	const bash = call("bash", "reconciled-merged-bash");
+	const leading = { type: "text" as const, text: "Temporary leading prose" };
+	const message = assistantMessage(leading, bash, {
+		type: "text",
+		text: "Retained trailing prose",
+	});
+	await h.emit("message_update", { message: structuredClone(message) });
+	await h.emit("assistant_message", { message: structuredClone(message) });
+	await record(h, bash);
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Globbed 2 patterns",
+	]);
+	const splitOwner = summary(h, bash);
+	expect(splitOwner.render(120).map(stripVTControlCharacters)).toEqual([
+		" • Ran 1 bash command",
+	]);
+	const cards = [first, persistedOnly, bash].map((item) => {
+		const card = host(h, item);
+		card.setArgsComplete();
+		card.setExecutionStarted();
+		return card;
+	});
+	leading.text = "";
+	// The end notification arrives before this message enters the branch snapshot.
+	await h.emit("message_end", { message: structuredClone(message) });
+	const expected = " • Ran 1 bash command, globbed 2 patterns";
+	expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+	expect(splitOwner.render(120)).toEqual([]);
+	for (const width of [120, 18, 120])
+		expectCollapsedTurnGroup(cards, expected, width, 120);
+	const next = call("grep", "reconciled-after-trailing");
+	await record(h, next);
+	for (const catchUp of [false, true]) {
+		if (catchUp) {
+			h.sessionManager.appendMessage(structuredClone(message));
+			h.sessionManager.appendMessage(assistantMessage(next));
+		}
+		await h.emit("tool_result");
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+		expect(summary(h, bash)).toBeUndefined();
+		expect(summary(h, next)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Grepped 1 pattern"],
+		);
+	}
+});
