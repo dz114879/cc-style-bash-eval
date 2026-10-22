@@ -2898,3 +2898,71 @@ test("late prose merges retain fuller persisted totals while the branch lags and
 		);
 	}
 });
+
+test.each([false, true])(
+	"ahead snapshots do not double-count calls during prose retraction (persisted-only=%s)",
+	async (withPersistedOnly) => {
+		const h = await start();
+		const first = call("glob", "ahead-first");
+		const persistedOnly = call("glob", "ahead-persisted-only");
+		await record(h, first);
+		const earlier = assistantMessage(
+			first,
+			...(withPersistedOnly ? [persistedOnly] : []),
+		);
+		h.sessionManager.appendMessage(earlier);
+		await h.emit("message_end", { message: structuredClone(earlier) });
+		const owner = summary(h, first);
+		const bash = call("bash", "ahead-bash");
+		const message = assistantMessage(
+			{ type: "text", text: "Temporary prose" },
+			bash,
+			{ type: "text", text: "Retained trailing prose" },
+		);
+		await h.emit("message_update", { message: structuredClone(message) });
+		await h.emit("assistant_message", { message: structuredClone(message) });
+		const finalized = structuredClone(message);
+		finalized.content[0] = { type: "text", text: "" };
+		h.sessionManager.appendMessage(finalized);
+		await h.emit("tool_result");
+		const expected = withPersistedOnly
+			? " • Ran 1 bash command, globbed 2 patterns"
+			: " • Ran 1 bash command, globbed 1 pattern";
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+		await record(h, bash);
+		const splitOwner = summary(h, bash);
+		const cards = [first, bash].map((item) => {
+			const card = host(h, item);
+			card.setArgsComplete();
+			card.setExecutionStarted();
+			return card;
+		});
+		await h.emit("message_end", { message: structuredClone(finalized) });
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+		expect(splitOwner.render(120)).toEqual([]);
+		for (const width of [120, 18, 120])
+			expectCollapsedTurnGroup(cards, expected, width, 120);
+		const next = call("grep", "ahead-after-trailing");
+		await record(h, next);
+		await h.emit("tool_result");
+		expect(owner.render(120).map(stripVTControlCharacters)).toEqual([expected]);
+		expect(summary(h, next)?.render(120).map(stripVTControlCharacters)).toEqual(
+			[" • Grepped 1 pattern"],
+		);
+		const replay = harness();
+		const savedEarlier = structuredClone(earlier);
+		const savedFinalized = structuredClone(finalized);
+		replay.sessionManager.appendMessage(savedEarlier);
+		replay.sessionManager.appendMessage(savedFinalized);
+		await start(replay);
+		const savedCalls = [
+			...savedEarlier.content,
+			...savedFinalized.content,
+		].filter((block): block is Call => block.type === "toolCall");
+		expect(
+			summary(replay, savedCalls[0])?.render(120).map(stripVTControlCharacters),
+		).toEqual([expected]);
+		for (const item of savedCalls.slice(1))
+			expect(summary(replay, item)).toBeUndefined();
+	},
+);

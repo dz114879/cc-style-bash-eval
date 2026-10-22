@@ -18,6 +18,11 @@ interface TurnGroup {
 	glob: number;
 }
 
+interface PersistedGroup extends TurnGroup {
+	prompt: number;
+	calls: { id: string; name: TrackedToolName; arguments: object }[];
+}
+
 function emptyTurnGroup(): TurnGroup {
 	return { bash: 0, eval: 0, grep: 0, glob: 0 };
 }
@@ -187,7 +192,7 @@ export class TurnGroups {
 	private current: TurnGroup = emptyTurnGroup();
 	private readonly calls = new WeakMap<object, Membership>();
 	private readonly liveById = new Map<string, Membership>();
-	private readonly persistedTotals = new WeakMap<TurnGroup, TurnGroup>();
+	private readonly persistedTotals = new WeakMap<TurnGroup, PersistedGroup>();
 	private readonly members = new WeakMap<TurnGroup, Membership[]>();
 	private readonly mergedInto = new WeakMap<TurnGroup, TurnGroup>();
 	private branch = new WeakMap<object, TurnGroupSummary>();
@@ -224,14 +229,31 @@ export class TurnGroups {
 		return persisted && total(persisted) >= total(group) ? persisted : group;
 	}
 
+	private includePersistedCalls(group: TurnGroup): void {
+		const snapshot = this.persistedTotals.get(group);
+		if (!snapshot) return;
+		const members = this.members.get(group) ?? [];
+		for (const call of snapshot.calls) {
+			const key = callKey(snapshot.prompt, call.id, call.name);
+			if (this.calls.has(call.arguments) || this.liveById.has(key)) continue;
+			const membership = { group, index: total(group) };
+			group[call.name]++;
+			members.push(membership);
+			// Retain identity so another snapshot or a later callback cannot count it again.
+			this.calls.set(call.arguments, membership);
+			this.liveById.set(key, membership);
+		}
+		this.members.set(group, members);
+	}
+
 	private mergeGroups(previous: TurnGroup, next: TurnGroup): void {
 		// Earlier rewrites may already have merged either side of this boundary.
 		previous = this.resolveGroup(previous);
 		next = this.resolveGroup(next);
 		if (previous === next) return;
-		const previousTotals = this.reconciledTotals(previous);
-		const nextTotals = this.reconciledTotals(next);
-		const offset = total(previousTotals);
+		this.includePersistedCalls(previous);
+		this.includePersistedCalls(next);
+		const offset = total(previous);
 		const members = this.members.get(previous) ?? [];
 		for (const member of this.members.get(next) ?? []) {
 			member.group = previous;
@@ -240,10 +262,10 @@ export class TurnGroups {
 		}
 		this.members.set(previous, members);
 		this.members.delete(next);
-		previous.bash = previousTotals.bash + nextTotals.bash;
-		previous.eval = previousTotals.eval + nextTotals.eval;
-		previous.grep = previousTotals.grep + nextTotals.grep;
-		previous.glob = previousTotals.glob + nextTotals.glob;
+		previous.bash += next.bash;
+		previous.eval += next.eval;
+		previous.grep += next.grep;
+		previous.glob += next.glob;
 		this.persistedTotals.delete(previous);
 		this.persistedTotals.delete(next);
 		this.mergedInto.set(next, previous);
@@ -251,13 +273,9 @@ export class TurnGroups {
 	}
 
 	rebuild(entries: readonly SessionEntry[]): void {
-		type BranchGroup = TurnGroup & {
-			prompt: number;
-			calls: Extract<AssistantBlock, { type: "toolCall" }>[];
-		};
 		let prompt = 0;
-		let group: BranchGroup = { ...emptyTurnGroup(), prompt, calls: [] };
-		const groups: BranchGroup[] = [group];
+		let group: PersistedGroup = { ...emptyTurnGroup(), prompt, calls: [] };
+		const groups: PersistedGroup[] = [group];
 		const split = () => {
 			group = { ...emptyTurnGroup(), prompt, calls: [] };
 			groups.push(group);
@@ -272,7 +290,11 @@ export class TurnGroups {
 					if (isBoundary(block)) split();
 					else if (block.type === "toolCall" && isTrackedToolName(block.name)) {
 						group[block.name]++;
-						group.calls.push(block);
+						group.calls.push({
+							id: block.id,
+							name: block.name,
+							arguments: block.arguments,
+						});
 					}
 				}
 			}
@@ -300,7 +322,7 @@ export class TurnGroups {
 			for (const live of liveGroups) {
 				const previous = this.persistedTotals.get(live) ?? live;
 				if (total(totals) >= total(previous))
-					this.persistedTotals.set(live, totals);
+					this.persistedTotals.set(live, { ...totals, prompt, calls });
 			}
 		}
 	}
@@ -366,14 +388,17 @@ export class TurnGroups {
 		if (snapshotInput && observation) this.messagesByCall.set(key, observation);
 		this.recorded.add(key);
 		if (isTrackedToolName(toolName)) {
-			const index = total(this.current);
-			this.current[toolName]++;
-			const membership = { group: this.current, index };
-			const members = this.members.get(this.current) ?? [];
-			members.push(membership);
-			this.members.set(this.current, members);
+			let membership = this.liveById.get(key);
+			if (!membership) {
+				const index = total(this.current);
+				this.current[toolName]++;
+				membership = { group: this.current, index };
+				const members = this.members.get(this.current) ?? [];
+				members.push(membership);
+				this.members.set(this.current, members);
+				this.liveById.set(key, membership);
+			}
 			this.calls.set(input, membership);
-			this.liveById.set(key, membership);
 			if (snapshotInput) this.calls.set(snapshotInput, membership);
 		} else if (!observation) this.closeGroup();
 		observation?.drain();
